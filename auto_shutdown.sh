@@ -14,10 +14,10 @@ TRAFF_DAY_USED=$(vnstat --oneline b | awk -F';' '{print $6}')
 
 DAY_GB=$(expr $TRAFF_DAY_USED / 1073741824)
 
-if [ $MONTH_GB -gt $TRAFF_MONTH_TOTAL ]; then
+if [ $MONTH_GB -ge $TRAFF_MONTH_TOTAL ]; then
     shutdown -h now
 fi
 
-if [ $DAY_GB -gt $TRAFF_DAY_TOTAL ]; then
+if [ $DAY_GB -ge $TRAFF_DAY_TOTAL ]; then
     shutdown -h now
 fi
