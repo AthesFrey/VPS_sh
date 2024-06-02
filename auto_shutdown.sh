@@ -3,7 +3,7 @@
 
 
 TRAFF_MONTH_TOTAL=750 #改成自己的预定额度，建议稍小些，单位GB;
-TRAFF_DAY_TOTAL=15 #改成自己的预定额度，建议稍小些，单位GB;
+TRAFF_DAY_TOTAL=25 #改成自己的预定额度，建议稍小些，单位GB;
 
 
 TRAFF_USED=$(vnstat --oneline b | awk -F';' '{print $11}')
