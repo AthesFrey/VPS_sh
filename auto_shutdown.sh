@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 指定解释器的方式
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 source /etc/profile
-# 或者 source ~/.bashrc
 
 TRAFF_MONTH_TOTAL=500 # 改成自己的预定额度，建议稍小些，单位GB
 TRAFF_DAY_TOTAL=17   # 改成自己的预定额度，建议稍小些，单位GB
@@ -21,3 +21,4 @@ if [ "$DAY_GB" -ge "$TRAFF_DAY_TOTAL" ]; then
     echo "Daily traffic limit exceeded. Shutting down."
     sudo shutdown -h now
 fi
+
