@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 指定解释器的方式
-# doremi
+source /etc/profile
+# 或者 source ~/.bashrc
 
 TRAFF_MONTH_TOTAL=500 # 改成自己的预定额度，建议稍小些，单位GB
 TRAFF_DAY_TOTAL=17   # 改成自己的预定额度，建议稍小些，单位GB
