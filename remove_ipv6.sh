@@ -13,18 +13,17 @@ desired_value="1"
 # 备份原始的 /etc/sysctl.conf 文件
 sudo cp /etc/sysctl.conf /etc/sysctl.conf.bak
 
-# 遍历每个变量进行检查和处理
 for var in "${variables[@]}"; do
-  # 使用 grep 查找非注释的配置行
-  if grep -E "^[^#]*\b${var}[[:space:]]*=" /etc/sysctl.conf >/dev/null; then
+  # 使用 grep 查找非注释的配置行，忽略以 # 开头的行
+  if grep -E "^[[:space:]]*${var}[[:space:]]*=" /etc/sysctl.conf | grep -v "^[[:space:]]*#" >/dev/null; then
     # 提取当前变量的值
-    current_value=$(grep -E "^[^#]*\b${var}[[:space:]]*=" /etc/sysctl.conf | sed -E "s/^[^#]*\b${var}[[:space:]]*=[[:space:]]*([0-9]+).*$/\1/")
-    if [ "$current_value" = "0" ]; then
-      # 如果值为 0，修改为 1
-      sudo sed -i "s/^\([^#]*\b${var}[[:space:]]*=[[:space:]]*\).*$/\1$desired_value/" /etc/sysctl.conf
-      echo "已将 $var 的值从 0 修改为 $desired_value"
+    current_value=$(grep -E "^[[:space:]]*${var}[[:space:]]*=" /etc/sysctl.conf | grep -v "^[[:space:]]*#" | head -n 1 | awk -F '=' '{print $2}' | tr -d '[:space:]')
+    if [ "$current_value" != "$desired_value" ]; then
+      # 修改变量的值为期望值
+      sudo sed -i "/^[[:space:]]*${var}[[:space:]]*=/{ /^[[:space:]]*#/! s|^\([[:space:]]*${var}[[:space:]]*=[[:space:]]*\).*|\1$desired_value| }" /etc/sysctl.conf
+      echo "已将 $var 的值修改为 $desired_value"
     else
-      echo "$var 已设置为 $desired_value，无需修改"
+      echo "$var 已经设置为 $desired_value，无需修改"
     fi
   else
     # 如果变量不存在，添加到文件末尾
