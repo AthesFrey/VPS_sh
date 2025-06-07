@@ -2,8 +2,8 @@
 #====================================================
 #  System  : CentOS 7+ / Debian 8+ / Ubuntu 16+
 #  Author  : NET DOWNLOAD (改进 by ChatGPT 2025-06)
-#  Script  : Realm All-in-One Manager (优化版)
-#  Version : 1.3-r1 (2025-06-07)
+#  Script  : Realm All-in-One Manager (带备注增强版)
+#  Version : 1.5  (2025-06-07)
 #====================================================
 set -euo pipefail
 
@@ -53,10 +53,15 @@ fetch_realm() {
   for url in "${MIRRORS[@]}"; do
     echo -e "${BLUE}尝试下载：${url}${ENDCOLOR}"
     if curl -fsSL "$url" | tar -xz -C "$tmpdir"; then
-      install -m 755 "$tmpdir"/realm*/realm "$REALM_BIN_PATH"
-      rm -rf "$tmpdir"
-      logop "下载 Realm 成功 $url"
-      return 0
+      local bin
+      bin=$(find "$tmpdir" -type f -name realm | head -n1)
+      if [[ -n "$bin" && ( -x "$bin" || -f "$bin" ) ]]; then
+        install -m 755 "$bin" "$REALM_BIN_PATH"
+        rm -rf "$tmpdir"
+        logop "下载 Realm 成功 $url"
+        return 0
+      fi
+      echo -e "${YELLOW}下载内容无 realm 二进制，切换下一个…${ENDCOLOR}"
     else
       echo -e "${YELLOW}镜像不可用，切换下一个…${ENDCOLOR}"
     fi
@@ -116,6 +121,7 @@ add_rule() {
   read -rp "远程目标端口: " remote_port
   read -rp "协议 [tcp/udp, 默认tcp]: " proto
   proto=${proto,,}; [[ $proto == udp ]] || proto=tcp
+  read -rp "备注（可选，回车跳过）: " note
 
   valid_port "$listen_port" && valid_port "$remote_port" && [[ -n "$remote_addr" ]] || {
     echo -e "${RED}输入有误！${ENDCOLOR}"; return; }
@@ -135,10 +141,11 @@ add_rule() {
 listen   = "0.0.0.0:${listen_port}"
 remote   = "${remote_addr}:${remote_port}"
 protocol = "${proto}"
+note     = "${note}"
 EOF
 
   echo -e "${GREEN}规则添加成功，重启 Realm…${ENDCOLOR}"
-  logop "添加规则 ${listen_port} -> ${remote_addr}:${remote_port} [${proto}]"
+  logop "添加规则 ${listen_port} -> ${remote_addr}:${remote_port} [${proto}] 备注:${note}"
   systemctl restart realm && echo -e "${GREEN}已重启。${ENDCOLOR}"
 }
 
@@ -149,9 +156,15 @@ delete_rule() {
   show_rules
   read -rp "输入要删除的监听端口: " del_port
   backup_config
-  awk -v p="$del_port" 'BEGIN{RS="";ORS="\n\n"} !/listen = "0\.0\.0\.0:"p"\"/' \
-      "$REALM_CONFIG_PATH" >"$REALM_CONFIG_PATH.tmp" &&
-      mv "$REALM_CONFIG_PATH.tmp" "$REALM_CONFIG_PATH"
+  # 以 [[endpoints]] 为分隔块，准确匹配 listen 字段，整块删除
+  awk -v p="$del_port" '
+    BEGIN{RS="\\[\\[endpoints\\]\\]"; ORS=""; first=1}
+    NF{
+      block="[[endpoints]]" $0
+      if(block ~ "listen *= *\"0\\.0\\.0\\.0:" p "\"") next
+      if(first){print block; first=0} else{print "\n" block}
+    }
+  ' "$REALM_CONFIG_PATH" > "$REALM_CONFIG_PATH.tmp" && mv "$REALM_CONFIG_PATH.tmp" "$REALM_CONFIG_PATH"
 
   systemctl restart realm && echo -e "${GREEN}规则删除并重启完毕。${ENDCOLOR}"
   logop "删除规则 $del_port"
@@ -161,13 +174,26 @@ show_rules() {
   check_install || { echo -e "${RED}请先安装 Realm。${ENDCOLOR}"; return; }
   echo -e "${BLUE}当前转发规则:${ENDCOLOR}"
   div
+  printf "%-8s %-4s %-23s %-23s %-s\n" "端口" "协议" "本地" "目标" "备注"
+  div
   if grep -q "\[\[endpoints\]\]" "$REALM_CONFIG_PATH"; then
     awk '
-      $1=="listen"  {gsub(/.*:/,"",$3);gsub(/"/,"",$3);port=$3}
-      $1=="remote"  {sub(/remote = /,"");gsub(/"/,"");remote=$0}
-      $1=="protocol" {gsub(/"/,"",$3);proto=$3;
-         printf("监听 %-6s | %-3s -> %s\n",port,proto,remote)}' \
-      "$REALM_CONFIG_PATH"
+      $1=="listen"   {gsub(/.*:/,"",$3);gsub(/"/,"",$3);port=$3; local="0.0.0.0:"port}
+      $1=="remote"   {gsub(/"/,"",$3); remote=$3}
+      $1=="protocol" {gsub(/"/,"",$3); proto=$3}
+      $1=="note"     {note=substr($0,index($0,"=")+2);gsub(/"/,"",note)}
+      /^\[\[endpoints\]\]/ {
+        if(port!=""){
+          printf "%-8s %-4s %-23s %-23s %s\n", port, proto, local, remote, note
+          port=proto=local=remote=note=""
+        }
+      }
+      END {
+        if(port!=""){
+          printf "%-8s %-4s %-23s %-23s %s\n", port, proto, local, remote, note
+        }
+      }
+    ' "$REALM_CONFIG_PATH"
   else
     echo -e "${YELLOW}暂无规则${ENDCOLOR}"
   fi
@@ -205,21 +231,22 @@ uninstall_realm() {
 
 show_help() {
   clear
-  echo -e "${BLUE}Realm 中转一键管理脚本 (v1.3-r1)${ENDCOLOR}"
+  echo -e "${BLUE}Realm 中转一键管理脚本 (v1.5)${ENDCOLOR}"
   div
   echo -e "支持 CentOS 7+ / Debian 8+ / Ubuntu 16+ (systemd)，自动多镜像安装、TCP/UDP 端口转发、"
-  echo -e "自启管理、配置备份和日志记录。"
+  echo -e "支持备注字段，规则可视化、自启管理、配置备份和日志记录。"
   echo -e "配置文件：$REALM_CONFIG_PATH"
   echo -e "日志文件：$REALM_LOG_PATH"
   echo -e "项目主页：https://github.com/zhboner/realm"
   div
-  read -rn1 -p "按 Enter 返回..."
+  echo -e "${YELLOW}按 Enter 返回主菜单...${ENDCOLOR}"
+  read -rn1
 }
 
 # ---------- 主菜单 ----------
 while true; do
   clear
-  echo -e "${BLUE}Realm 中转一键管理脚本 (v1.3-r1)${ENDCOLOR}"
+  echo -e "${BLUE}Realm 中转一键管理脚本 (v1.5)${ENDCOLOR}"
   echo "1. 安装 Realm"
   echo "2. 添加转发规则"
   echo "3. 删除转发规则"
@@ -249,5 +276,6 @@ while true; do
     0) exit 0 ;;
     *) echo -e "${RED}无效输入！${ENDCOLOR}" ;;
   esac
-  read -rn1 -p $'\n'"${YELLOW}按 Enter 返回主菜单...${ENDCOLOR}"
+  echo -e "${YELLOW}按 Enter 返回主菜单...${ENDCOLOR}"
+  read -rn1
 done
