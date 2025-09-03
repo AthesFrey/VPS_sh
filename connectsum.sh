@@ -19,9 +19,27 @@ function dport(line) {
   if (match(line, /dport [0-9]+/)) return substr(line,RSTART+6,RLENGTH-6)
   return ""
 }
-function saddr(line) {
-  if (match(line, /SRC=[0-9A-Fa-f:.]+/))   return substr(line,RSTART+4,RLENGTH-4)
-  if (match(line, /saddr=[0-9A-Fa-f:.]+/)) return substr(line,RSTART+6,RLENGTH-6)
+function saddr(line, val) {
+  # 先抓 IPv4
+  if (match(line, /SRC=[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/)) {
+    return substr(line, RSTART+4, RLENGTH-4)
+  }
+  # 再抓可能的 IPv6（避免把 MAC 误判为 IPv6：MAC 是 6 段2位十六进制）
+  if (match(line, /SRC=[0-9A-Fa-f:]+/)) {
+    val = substr(line, RSTART+4, RLENGTH-4)
+    if (val !~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/) return val
+  }
+  # 兼容 nft 的 SADDR=/saddr=（可能是 IP 也可能是 MAC），同样过滤 MAC
+  if (match(line, /SADDR=[0-9A-Fa-f:.]+/)) {
+    val = substr(line, RSTART+6, RLENGTH-6)
+    if (val ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/) return val
+    if (val ~ /:/ && val !~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/) return val
+  }
+  if (match(line, /saddr=[0-9A-Fa-f:.]+/)) {
+    val = substr(line, RSTART+6, RLENGTH-6)
+    if (val ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/) return val
+    if (val ~ /:/ && val !~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/) return val
+  }
   return ""
 }
 function proto(line) {
