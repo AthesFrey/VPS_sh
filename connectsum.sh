@@ -72,7 +72,9 @@ END {
       print "INFO: 匹配行=" matched ", 分组数=" groups ", 总 hits=" total > "/dev/stderr"
     }
   }
-}' \
-# 排序与截断（不写临时文件）
-# shellcheck disable=SC2034
-| ( IFS= read -r header; printf "%s\n" "$header"; sort -t, -k6,6nr | head -n "${LIMIT}" )
+}' | {
+  IFS= read -r header
+  printf "%s\n" "$header"
+  sort -t, -k6,6nr | head -n "${LIMIT}"
+}
+
