@@ -37,6 +37,26 @@ for ip in "${EXISTING[@]:-}"; do
   fi
 done
 
+# 进一步过滤掉不应作为接口上游 DNS 的地址，避免 resolvectl 报错：
+#  - 127.0.0.0/8（含 127.0.0.53）、0.0.0.0、::1、链路本地 IPv6 (fe80::/10)
+TMP=()
+for ip in "${VALID[@]:-}"; do
+  # 过滤 127.x.x.x
+  if [[ "$ip" =~ ^127\. ]]; then
+    continue
+  fi
+  # 过滤 0.0.0.0
+  if [[ "$ip" == "0.0.0.0" ]]; then
+    continue
+  fi
+  # 过滤 ::1 与 fe80::/10
+  if [[ "$ip" == "::1" || "$ip" =~ ^fe[89abAB][0-9a-fA-F]: ]]; then
+    continue
+  fi
+  TMP+=("$ip")
+done
+VALID=("${TMP[@]}")
+
 # 组装目标 DNS 列表
 FINAL=()
 if [[ "${KEEP_EXISTING}" = "1" && "${#VALID[@]}" -gt 0 ]]; then
@@ -62,14 +82,14 @@ fi
 
 if [[ $IS_STUB -eq 1 ]] && command -v resolvectl >/dev/null 2>&1; then
   # 使用 systemd-resolved
-  IFACE="$(ip -o -4 route show to default 2>/dev/null | awk '{print $5; exit}')"
-  [[ -n "${IFACE:-}" ]] || IFACE="$(ip -o -6 route show to default 2>/dev/null | awk '{print $5; exit}')"
+  IFACE="$(ip -o -4 route show to default 2>/dev/null | awk '{print $5; exit}')" || true
+  [[ -n "${IFACE:-}" ]] || IFACE="$(ip -o -6 route show to default 2>/dev/null | awk '{print $5; exit}')" || true
 
   if [[ -n "${IFACE:-}" ]]; then
     log "检测到 systemd-resolved；设置接口 ${IFACE} 的 DNS（运行时）"
     resolvectl dns "${IFACE}" "${FINAL[@]}" || true
     # 注意是单数 domain
-    resolvectl domain "${IFACE}" '~.' || true   # 将此链路作为默认域路由
+    resolvectl domain "${IFACE}" '~.' || true  # 将此链路作为默认域路由
     resolvectl flush-caches || true
   else
     log "未能识别默认路由网卡，将仅写入持久化配置（如启用 PERSIST）"
