@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# safe_nft_setup_v2.sh — "Secure out-of-the-box" firewall script
+# safe_nft_setup_v2.sh — "Secure out-of-the-box" firewall script - should be with connectsum.sh!
 set -euo pipefail
 
 MODE="${MODE:-permissive}"                # permissive | hardened
