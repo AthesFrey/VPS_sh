@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# setup_hy2_dnat_ufw.sh (v5.1, Bookworm-ready)
-# 目标：UFW 主控 + systemd 在 UFW 之后补一条 DNAT（HY2 客户端原生跳端口）
+# setup_hy2_dnat_ufw_fixed.sh
+# For HY2
+# 目标：UFW 主控 + systemd 在 UFW 之后补一条本机端口“跳端口”映射（HY2 客户端原生跳端口）
+# 改进点：修复 backports 循环分号、分离 heredoc、DNAT→REDIRECT、保留原有交互与提示
 set -euo pipefail
 
 cecho(){ printf "\033[1;32m%s\033[0m\n" "$*"; }
@@ -12,7 +14,6 @@ detect_ssh_port(){ awk '/^[Pp]ort[[:space:]]+[0-9]+/ {p=$2} END{print p?p:22}' /
 detect_debian_codename(){ . /etc/os-release 2>/dev/null || true; echo "${VERSION_CODENAME:-}"; }
 
 maybe_disable_backports() {
-  # 仅当用户在老系统且更新失败，并且选择允许时，才禁用 backports
   wecho "尝试禁用 *-backports 源（支持 .list 与 .sources）以绕过 apt 404……"
   # 注释 .list backports 行
   for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
@@ -37,13 +38,11 @@ apt_update_smart() {
   if apt-get update -y; then
     return 0
   fi
-  # 如果是 debian 12（bookworm），我们不去禁用 backports，提示用户检查网络/镜像即可
   local codename; codename="$(detect_debian_codename)"
   if [[ "$codename" =~ ^(bookworm|trixie)$ ]]; then
     eecho "apt-get update 失败（$codename）。请检查网络/镜像源或稍后重试（不建议动 backports）。"
     exit 1
   fi
-  # 非 bookworm 才询问是否禁用 backports
   wecho "检测到非 bookworm 且 update 失败。是否尝试禁用 backports 后重试？(y/N)"
   read -r ans
   if [[ "${ans:-N}" =~ ^[Yy]$ ]]; then
@@ -55,10 +54,9 @@ apt_update_smart() {
   fi
 }
 
-
 # ---------------- 主流程 ----------------
 require_root
-cecho "== HY2 DNAT + UFW 一键配置（Debian 12 / bookworm 友好） =="
+cecho "== HY2 端口跳跃 + UFW 一键配置（Debian 12 / bookworm 友好） =="
 
 DEFAULT_LISTEN="2567"
 DEFAULT_RANGE="15000:18369"
@@ -67,8 +65,10 @@ SSH_PORT="$(detect_ssh_port)"
 
 read -rp "HY2 监听端口（默认 ${DEFAULT_LISTEN}，仅数字）: " LISTEN_PORT
 LISTEN_PORT="${LISTEN_PORT:-$DEFAULT_LISTEN}"
+
 read -rp "端口跳跃范围（默认 ${DEFAULT_RANGE}，格式 15000:18369）: " RANGE
 RANGE="${RANGE:-$DEFAULT_RANGE}"
+
 read -rp "协议（udp/tcp，默认 ${DEFAULT_PROTO}，HY2 用 udp）: " PROTO
 PROTO="${PROTO:-$DEFAULT_PROTO}"
 
@@ -78,12 +78,13 @@ read -rp "UFW 是否同时放行端口段 ${RANGE}/${PROTO}（安全面更大）
 [[ "${allow_r:-N}" =~ ^[Yy]$ ]] && ALLOW_RANGE="y"
 
 cecho "配置预览："
-echo "  系统版本          : $(. /etc/os-release 2>/dev/null; echo ${PRETTY_NAME:-unknown})"
-echo "  SSH 端口          : ${SSH_PORT}/tcp"
-echo "  HY2 监听端口      : ${LISTEN_PORT}/${PROTO}"
-echo "  端口跳跃范围(入口): ${RANGE}/${PROTO}"
-echo "  DNAT 映射         : ${RANGE}/${PROTO}  →  :${LISTEN_PORT}"
-echo "  UFW 放行端口段    : ${ALLOW_RANGE}"
+echo " 系统版本 : $(. /etc/os-release 2>/dev/null; echo ${PRETTY_NAME:-unknown})"
+echo " SSH 端口 : ${SSH_PORT}/tcp"
+echo " HY2 监听端口 : ${LISTEN_PORT}/${PROTO}"
+echo " 端口跳跃范围(入口): ${RANGE}/${PROTO}"
+echo " 映射方式 : PREROUTING REDIRECT → :${LISTEN_PORT}"
+echo " UFW 放行端口段 : ${ALLOW_RANGE}"
+
 read -rp "确认执行？(y/N): " go
 [[ "${go:-N}" =~ ^[Yy]$ ]] || { wecho "已取消。"; exit 0; }
 
@@ -112,7 +113,7 @@ wecho "启用 UFW（若已启用会跳过）"
 ufw --force enable
 systemctl enable ufw >/dev/null 2>&1 || true
 
-# [4/7] 生成 /root/hy2-dnat.sh（强化：按“行号”删光该端口段的所有 DNAT，然后再加）
+# [4/7] 生成 /root/hy2-dnat.sh（先清空范围内旧规则，再加一条 REDIRECT）
 wecho "[4/7] 生成 /root/hy2-dnat.sh"
 cat >/root/hy2-dnat.sh <<'EOSH'
 #!/usr/bin/env bash
@@ -121,23 +122,20 @@ RANGE="${RANGE:-15000:18369}"
 TGT_PORT="${TGT_PORT:-2567}"
 PROTO="${PROTO:-udp}"
 
-# 删除该端口段上的所有 DNAT（用行号方式，兼容不同目标端口/不同注释）
-# 先提取匹配的行号（两次 grep：dpt:RANGE + DNAT）
-mapfile -t LNS < <(iptables -t nat -L PREROUTING -n --line-numbers \
-  | awk '/DNAT/ && /dpt:'"$RANGE"'/{print $1}')
-# 逆序删除（行号会随删除而变化，倒序才稳妥）
+# 删除该端口段上的所有 REDIRECT/DNAT（行号倒序删除更稳妥）
+mapfile -t LNS < <(iptables -t nat -L PREROUTING -n --line-numbers | awk '/(REDIRECT|DNAT)/ && /dpt:'"$RANGE"'/{print $1}')
 for (( idx=${#LNS[@]}-1; idx>=0; idx-- )); do
   ln="${LNS[$idx]}"
   [ -n "$ln" ] && iptables -t nat -D PREROUTING "$ln" || true
 done
 
-# 重新加一条带标记的 DNAT
+# 重新加一条带标记的本机端口重定向（更通用）
 iptables -t nat -A PREROUTING -p "$PROTO" --dport "$RANGE" \
-  -m comment --comment "HY2 DNAT autoload" \
-  -j DNAT --to-destination ":${TGT_PORT}"
+  -m comment --comment "HY2 REDIRECT autoload" \
+  -j REDIRECT --to-ports "$TGT_PORT"
 
-# 打印当前 DNAT 规则以便核对
-iptables -t nat -S PREROUTING | grep -E 'DNAT|HY2 DNAT autoload' || true
+# 打印当前规则以便核对
+iptables -t nat -S PREROUTING | grep -E 'REDIRECT|DNAT|HY2 (REDIRECT|DNAT) autoload' || true
 EOSH
 chmod 700 /root/hy2-dnat.sh
 
@@ -149,11 +147,11 @@ TGT_PORT="${LISTEN_PORT}"
 PROTO="${PROTO}"
 EOF
 
-# [6/7] systemd 服务（确保在 UFW 之后执行）
-wecho "[6/7] 生成并启用 hy2-dnat.service"
+# [6/7] 写入 systemd 单元（独立 heredoc，避免重定向冲突）
+wecho "[6/7] 写入 /etc/systemd/system/hy2-dnat.service"
 cat >/etc/systemd/system/hy2-dnat.service <<'EOSVC'
 [Unit]
-Description=HY2 DNAT rule autoloader (runs after UFW)
+Description=HY2 DNAT/REDIRECT rule autoloader (runs after UFW)
 After=ufw.service network-online.target
 Wants=network-online.target
 
@@ -173,9 +171,9 @@ systemctl daemon-reload
 systemctl enable --now hy2-dnat.service
 
 # [7/7] 验证
-cecho "[7/7] 验证：DNAT 规则 / 监听 / 服务状态"
-echo "---- DNAT 规则（应看到 PREROUTING DNAT → :${LISTEN_PORT}) ----"
-iptables -t nat -S PREROUTING | grep -E "DNAT|:${LISTEN_PORT}" || echo "DNAT 未出现"
+cecho "[7/7] 验证：规则 / 监听 / 服务状态"
+echo "---- PREROUTING（应看到 REDIRECT → :${LISTEN_PORT}) ----"
+iptables -t nat -S PREROUTING | grep -E "REDIRECT|:${LISTEN_PORT}" || echo "规则未出现"
 
 echo "---- 监听状态（需 sing-box 已启动，应看到 :${LISTEN_PORT}/${PROTO}) ----"
 ss -lunp | grep -E ":${LISTEN_PORT}\b" || echo "${LISTEN_PORT}/${PROTO} 未监听（请确认 sing-box 已启动）"
