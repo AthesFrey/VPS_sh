@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # safe_nft_setup.sh — Idempotent nftables setup with pre-clean & connection logging
+# must be followed by connectsum.sh!
 # 特点：
 # - 仅使用 table inet，不触碰 iptables-nft 管理的 table ip/ip6
 # - 幂等：先备份当前 ruleset，并清理目录中任何旧的 baseline/connlog 定义（声明式/命令式都覆盖）
