@@ -1,3 +1,6 @@
+好的，已按 RTT=150ms 调整，仅把注释和缓冲上限从 16MB 提到 32MB（留出 \~18.8MB BDP 的余量）；其余参数保持不变：
+
+```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -18,7 +21,7 @@ iface="$(ip -o -4 route show to default 2>/dev/null | awk '{print $5}' | head -1
 # 直接写入最终配置（加载顺序靠后，覆盖其它值）
 # 注意：不依赖任何外部脚本或临时文件
 cat >/etc/sysctl.d/999-net-bbr-fq.conf <<'EOF'
-# Network TCP tuning for ~75ms RTT, 1GB RAM, 1Gbps
+# Network TCP tuning for ~150ms RTT, 1GB RAM, 1Gbps
 # Load-last override; safe on Ubuntu 22/24 and Debian 11/12/13+
 
 # BBR + pacing（fq）
@@ -35,11 +38,11 @@ net.ipv4.tcp_moderate_rcvbuf = 1
 # ECN 协商允许（遇到不兼容中间盒会回退）
 net.ipv4.tcp_ecn = 1
 
-# 缓冲上限（16MB），默认值适度抬高以适配 ~9.4MB BDP（1Gbps×75ms）
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 131072 16777216
-net.ipv4.tcp_wmem = 4096 262144 16777216
+# 缓冲上限（32MB），适配 ~18.8MB BDP（1Gbps×150ms），略留余量
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.tcp_rmem = 4096 131072 33554432
+net.ipv4.tcp_wmem = 4096 262144 33554432
 
 # 更安全的 TIME-WAIT 处理
 net.ipv4.tcp_rfc1337 = 1
@@ -74,3 +77,4 @@ if command -v tc >/dev/null 2>&1 && [ -n "${iface:-}" ]; then
   tc qdisc show dev "$iface" || true
 fi
 echo "--------------"
+```
