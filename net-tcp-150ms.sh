@@ -1,6 +1,3 @@
-好的，已按 RTT=150ms 调整，仅把注释和缓冲上限从 16MB 提到 32MB（留出 \~18.8MB BDP 的余量）；其余参数保持不变：
-
-```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -77,4 +74,3 @@ if command -v tc >/dev/null 2>&1 && [ -n "${iface:-}" ]; then
   tc qdisc show dev "$iface" || true
 fi
 echo "--------------"
-```
