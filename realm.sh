@@ -25,7 +25,6 @@ ASSET_ARM="realm-aarch64-unknown-linux-gnu.tar.gz"
 MIRRORS=(
   "https://ghfast.top/https://github.com/zhboner/realm/releases/latest/download"
   "https://gh-proxy.com/https://github.com/zhboner/realm/releases/latest/download"
-  "https://download.fastgit.org/zhboner/realm/releases/latest/download"
   "https://github.com/zhboner/realm/releases/latest/download"
 )
 
