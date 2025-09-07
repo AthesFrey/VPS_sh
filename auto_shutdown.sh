@@ -1,55 +1,57 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+# 流量阈值触发关机（按 vnstat oneline 取值；单位：GiB=1024^3；仅整数）
+# 可选：导出 IFACE 环境变量以固定网卡，例如：
+#   IFACE=eth0 bash traffic_guard.sh
 
-# 统一环境，避免 locale/路径问题
+set -Eeuo pipefail
 export LC_ALL=C
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# === 可配置阈值（单位：GiB，1024^3）===
-TRAFF_MONTH_TOTAL_GIB=500   # 每月额度（建议略小于ISP套餐上限）
-TRAFF_DAY_TOTAL_GIB=17      # 每日额度（建议略小）
+# ===== 配置（GiB，整数）=====
+TRAFF_MONTH_TOTAL_GiB=500   # 每月额度（GiB，建议略小于套餐）
+TRAFF_DAY_TOTAL_GiB=17      # 每日额度（GiB）
 
-# 依赖检测
+# ===== 依赖检查 =====
 command -v vnstat >/dev/null 2>&1 || {
-  echo "[error] vnstat 未安装。请先安装并确保已收集到数据。"
+  echo "[error] vnstat 未安装" >&2
   exit 2
 }
 
-# 取今天日期（dumpdb 的月份/日期通常为不带前导零的整数，做个去零处理更保险）
-Y=$(date +%Y)
-M=$(date +%m | sed 's/^0\+//')
-D=$(date +%d | sed 's/^0\+//')
+# ===== 取值（字节，整数；防科学计数法）=====
+# 说明：$11=本月总字节，$6=今日总字节（来自 vnstat --oneline b）
+# 支持通过 IFACE 固定接口：IFACE=eth0
+VNOPT=()
+if [ "${IFACE:-}" != "" ]; then
+  VNOPT=(-i "$IFACE")
+fi
 
-# 从 dumpdb 解析：单位为 KiB（1024 字节）
-# 月用量：m;year;month;rxKiB;txKiB;...
-MONTH_KIB=$(
-  vnstat --dumpdb | awk -F';' -v y="$Y" -v m="$M" '
-    $1=="m" && $2==y && $3==m { sum = $4 + $5 } END { if (sum=="") sum=0; print sum }
-'
+TRAFF_USED=$(
+  vnstat "${VNOPT[@]}" --oneline b | awk -F';' '
+    NF>=11 {printf "%.0f\n", $11+0; f=1}
+    END {if(!f) print 0}
+  '
+)
+TRAFF_DAY_USED=$(
+  vnstat "${VNOPT[@]}" --oneline b | awk -F';' '
+    NF>=6 {printf "%.0f\n", $6+0; f=1}
+    END {if(!f) print 0}
+  '
 )
 
-# 日用量：d;year;month;day;rxKiB;txKiB;...
-DAY_KIB=$(
-  vnstat --dumpdb | awk -F';' -v y="$Y" -v m="$M" -v d="$D" '
-    $1=="d" && $2==y && $3==m && $4==d { sum = $5 + $6 } END { if (sum=="") sum=0; print sum }
-'
-)
+# ===== 字节 -> GiB（整数，向下取整）=====
+# 1073741824 = 1024^3
+MONTH_GiB=$(( TRAFF_USED / 1073741824 ))
+DAY_GiB=$(( TRAFF_DAY_USED / 1073741824 ))
 
-# KiB -> GiB（KiB / 1024^2 = GiB），使用整数除法，向下取整
-MONTH_GIB=$(( MONTH_KIB / 1048576 ))
-DAY_GIB=$(( DAY_KIB / 1048576 ))
+echo "[info] iface=${IFACE:-default}  month=${MONTH_GiB}GiB  day=${DAY_GiB}GiB"
 
-printf '[info] %04d-%02d-%02d  已用：月=%d GiB  日=%d GiB\n' "$Y" "$M" "$D" "$MONTH_GIB" "$DAY_GIB"
-
-# 先判月，再判日（或按你需要先判哪一个都行）
-if (( MONTH_GIB >= TRAFF_MONTH_TOTAL_GIB )); then
-  echo "[warn] Monthly traffic limit exceeded: ${MONTH_GIB} >= ${TRAFF_MONTH_TOTAL_GIB} GiB. Shutting down..."
+# ===== 阈值判断并关机 =====
+if (( MONTH_GiB >= TRAFF_MONTH_TOTAL_GiB )); then
+  echo "[warn] Monthly traffic limit exceeded: ${MONTH_GiB} >= ${TRAFF_MONTH_TOTAL_GiB} GiB. Shutting down..."
   /sbin/shutdown -h now || shutdown -h now
 fi
 
-if (( DAY_GIB >= TRAFF_DAY_TOTAL_GIB )); then
-  echo "[warn] Daily traffic limit exceeded: ${DAY_GIB} >= ${TRAFF_DAY_TOTAL_GIB} GiB. Shutting down..."
+if (( DAY_GiB >= TRAFF_DAY_TOTAL_GiB )); then
+  echo "[warn] Daily traffic limit exceeded: ${DAY_GiB} >= ${TRAFF_DAY_TOTAL_GiB} GiB. Shutting down..."
   /sbin/shutdown -h now || shutdown -h now
 fi
-
-exit 0
