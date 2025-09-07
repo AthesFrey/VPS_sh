@@ -24,7 +24,6 @@
 #   REALM_SPEED_LIMIT=16384
 #   REALM_SPEED_TIME=15
 # ======================================================
-
 set -Eeuo pipefail
 
 APP_NAME="realm"
@@ -34,7 +33,6 @@ CONF_DIR="/etc/${APP_NAME}"
 CONF_FILE="${CONF_DIR}/config.toml"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 LOG_FILE="/var/log/realm.log"
-
 TS="$(date +%F-%H%M%S)"
 TMP_DIR=""
 TGZ_PATH=""
@@ -46,7 +44,6 @@ ASSET_ARM="realm-aarch64-unknown-linux-gnu.tar.gz"
 MIRRORS=(
   "https://ghfast.top/https://github.com/zhboner/realm/releases/latest/download"
   "https://gh-proxy.com/https://github.com/zhboner/realm/releases/latest/download"
-  "https://download.fastgit.org/zhboner/realm/releases/latest/download"
   "https://github.com/zhboner/realm/releases/latest/download"
 )
 
