@@ -1,29 +1,10 @@
 #!/usr/bin/env bash
-# realm 安装/升级/卸载/节点管理 脚本（稳定版 v3.4）
-# 变更（相对 v3.3）：
-# - 修复 parse_endpoints()：只挂载“紧邻注释”给对应块，且不误判其他 [[table]]
-# - 支持 IPv6 host:port 形式（如 [::1]:443）
-# - 交互输入统一 trim 去空格
-# - CURL_OPTS 的 -4 选项按需追加，避免空参数
-# - 删除区间解析更稳固（支持倒序 7-5）
-#
-# 主要特性：
-# - systemd 前台运行（Type=simple，无 -d），杜绝重启环
-# - 镜像优先（ghfast -> gh-proxy -> fastgit -> 官方），下载多重校验
-# - 幂等：备份、差异更新 unit、清理残留、可重复运行
-# - 支持交互菜单与非交互参数：
-#     --install
-#     --upgrade --keep-config
-#     --upgrade --reset-config
-#     --uninstall [--purge]
-#     --status
-#
-# 环境变量：
-#   REALM_FORCE_IPV4=1
-#   REALM_MAXTIME=45
-#   REALM_SPEED_LIMIT=16384
-#   REALM_SPEED_TIME=15
+# realm 安装/升级/卸载/节点管理 脚本（稳定版 v3.9）
+# 变更（相对 v3.8）：
+# - 解析器修复：当处于上一块 [[endpoints]] 内时，遇到下一块的 "# remark:" 会先结束上一块（end=remark前一行），防止误删下一块备注
+# - 继续使用 AWK 区间过滤删除；主菜单循环；无 eid；remark 缺失显示为 null-remark；添加节点可连续添加；端口直输=0.0.0.0:PORT
 # ======================================================
+
 set -Eeuo pipefail
 
 APP_NAME="realm"
@@ -33,6 +14,7 @@ CONF_DIR="/etc/${APP_NAME}"
 CONF_FILE="${CONF_DIR}/config.toml"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 LOG_FILE="/var/log/realm.log"
+
 TS="$(date +%F-%H%M%S)"
 TMP_DIR=""
 TGZ_PATH=""
@@ -44,6 +26,7 @@ ASSET_ARM="realm-aarch64-unknown-linux-gnu.tar.gz"
 MIRRORS=(
   "https://ghfast.top/https://github.com/zhboner/realm/releases/latest/download"
   "https://gh-proxy.com/https://github.com/zhboner/realm/releases/latest/download"
+  "https://download.fastgit.org/zhboner/realm/releases/latest/download"
   "https://github.com/zhboner/realm/releases/latest/download"
 )
 
@@ -60,9 +43,9 @@ if [[ -n "${CURL_FORCE_IPv4_OPTS}" ]]; then
   CURL_OPTS+=("${CURL_FORCE_IPv4_OPTS}")
 fi
 
-log()  { printf "\033[1;32m[i]\033[0m %s\n" "$*" >&2; }
-warn() { printf "\033[1;33m[!]\033[0m %s\n" "$*" >&2; }
-err()  { printf "\033[1;31m[x]\033[0m %s\n" "$*" >&2; }
+log()  { command printf "\033[1;32m[i]\033[0m %s\n" "$*" >&2; }
+warn() { command printf "\033[1;33m[!]\033[0m %s\n" "$*" >&2; }
+err()  { command printf "\033[1;31m[x]\033[0m %s\n" "$*" >&2; }
 
 require_root(){ [[ $EUID -eq 0 ]] || { err "请以 root 运行（sudo -i 后执行）。"; exit 1; }; }
 
@@ -187,13 +170,13 @@ EOF
   if [[ -f "$SERVICE_FILE" ]]; then
     if ! diff -q <(echo "$unit_content") "$SERVICE_FILE" >/dev/null 2>&1; then
       backup_file "$SERVICE_FILE"
-      printf "%s" "$unit_content" > "$SERVICE_FILE"
+      command printf "%s" "$unit_content" > "$SERVICE_FILE"
       log "已更新 systemd 单元：$SERVICE_FILE"
     else
       log "systemd 单元无变化：$SERVICE_FILE"
     fi
   else
-    printf "%s" "$unit_content" > "$SERVICE_FILE"
+    command printf "%s" "$unit_content" > "$SERVICE_FILE"
     log "已写入 systemd 单元：$SERVICE_FILE"
   fi
 }
@@ -264,7 +247,7 @@ EOF
   install_binary
   write_service
   safe_enable
-  log "升级完成。当前版本：$(current版本)"
+  log "升级完成。当前版本：$(current_version)"
 }
 
 uninstall_keep_or_purge(){
@@ -301,47 +284,65 @@ ensure_config(){
   [[ -f "$CONF_FILE" ]] || write_default_config
 }
 
-# 解析并列出所有 [[endpoints]] 块，输出：idx|start|end|eid|remark|listen|remote
+# 解析并列出所有 [[endpoints]] 块，输出：idx|start|end|remark|listen|remote
 parse_endpoints(){
   ensure_config
   awk '
     BEGIN{
       idx=0; inblk=0; start=0
-      eid=""; remark=""; listen=""; remote=""
-      pend_eid=""; pend_remark=""
+      remark=""; listen=""; remote=""
+      pend_remark=""; pend_remark_line=0
     }
     function Trim(s){ sub(/^[ \t\r\n]+/,"",s); sub(/[ \t\r\n]+$/,"",s); return s }
     function flush_block(endline){
       if(inblk){
         idx++
-        printf("%d|%d|%d|%s|%s|%s|%s\n", idx, start, endline, eid, remark, listen, remote)
+        printf("%d|%d|%d|%s|%s|%s\n", idx, start, endline, remark, listen, remote)
       }
-      inblk=0; start=0; eid=""; remark=""; listen=""; remote=""
+      inblk=0; start=0; remark=""; listen=""; remote=""
     }
     {
       line=$0
-      if (match(line, /^[ \t]*#\s*eid:[ \t]*(.*)$/, m))   { pend_eid   = Trim(m[1]); next }
-      if (match(line, /^[ \t]*#\s*remark:[ \t]*(.*)$/, m)){ pend_remark= Trim(m[1]); next }
-
-      if (match(line, /^[ \t]*\[\[endpoints\]\][ \t]*$/)) {
-        if (inblk) flush_block(NR-1)
-        inblk=1; start=NR
-        eid=pend_eid; remark=pend_remark
-        listen=""; remote=""
-        pend_eid=""; pend_remark=""
-        next
-      }
 
       if (inblk) {
-        if (match(line, /^[ \t]*listen[ \t]*=[ \t]*"(.*)"/, m)) { listen = Trim(m[1]) }
-        if (match(line, /^[ \t]*remote[ \t]*=[ \t]*"(.*)"/, m)) { remote = Trim(m[1]) }
-        if (match(line, /^[ \t]*\[\[.*\]\]/)) {
-          flush_block(NR-1); inblk=0
+        # 若在块内遇到下一块的备注，先结束当前块（不吞掉该备注行）
+        if (match(line, /^[ \t]*#\s*remark:[ \t]*(.*)$/, m)){
+          flush_block(NR-1)
+          inblk=0
+          pend_remark = Trim(m[1]); pend_remark_line=NR
+          next
+        }
+        # 监听/后端
+        if (match(line, /^[ \t]*listen[ \t]*=[ \t]*"(.*)"/, m)) { listen = Trim(m[1]); next }
+        if (match(line, /^[ \t]*remote[ \t]*=[ \t]*"(.*)"/, m)) { remote = Trim(m[1]); next }
+        # 新块开始
+        if (match(line, /^[ \t]*\[\[endpoints\]\][ \t]*$/)) {
+          flush_block(NR-1)
+          inblk=1
+          if (pend_remark_line==NR-1) { start=pend_remark_line } else { start=NR }
+          remark=pend_remark
+          listen=""; remote=""
+          pend_remark=""; pend_remark_line=0
+          next
         }
         next
       }
 
-      if (line !~ /^[ \t]*#/) { pend_eid=""; pend_remark="" }
+      # 非块内逻辑
+      if (match(line, /^[ \t]*#\s*remark:[ \t]*(.*)$/, m)){
+        pend_remark = Trim(m[1]); pend_remark_line=NR; next
+      }
+
+      if (match(line, /^[ \t]*\[\[endpoints\]\][ \t]*$/)) {
+        inblk=1
+        if (pend_remark_line==NR-1) { start=pend_remark_line } else { start=NR }
+        remark=pend_remark
+        listen=""; remote=""
+        pend_remark=""; pend_remark_line=0
+        next
+      }
+
+      if (line !~ /^[ \t]*#/) { pend_remark=""; pend_remark_line=0 }
     }
     END{
       if (inblk) flush_block(NR)
@@ -356,10 +357,11 @@ list_endpoints(){
     echo "（暂无 [[endpoints]] 节点）"
     return 0
   fi
-  printf "Idx  Listen                      -> Remote                     | Remark\n"
-  printf "---- ---------------------------- ---------------------------- | -----------------------------\n"
-  while IFS='|' read -r idx start end eid remark listen remote; do
-    printf "%-4s %-28s -> %-28s | %s\n" "$idx" "${listen:-"-"}" "${remote:-"-"}" "${remark:-""}"
+  command printf '%s\n' "Idx  Listen                      -> Remote                     | Remark"
+  command printf '%s\n' "---- ---------------------------- ---------------------------- | -----------------------------"
+  while IFS='|' read -r idx start end remark listen remote; do
+    [[ -z "$remark" ]] && remark="null-remark"
+    command printf '%-4s %-28s -> %-28s | %s\n' "${idx}" "${listen:-"-"}" "${remote:-"-"}" "${remark}"
   done <<<"$rows"
 }
 
@@ -380,48 +382,65 @@ validate_hostport(){
   return 1
 }
 
-_trim(){ local s="$*"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+# 仅端口（数字）转为 0.0.0.0:PORT
+normalize_listen(){
+  local v="$1"
+  v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+  if [[ "$v" =~ ^[0-9]{1,5}$ ]]; then
+    echo "0.0.0.0:$v"
+    return 0
+  fi
+  echo "$v"
+}
+
+_trim(){ local s="$*"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; command printf '%s' "$s"; }
 
 add_endpoint_interactive(){
   ensure_config
-  local listen remote remark sniff http tls
-
   while true; do
-    read -rp "监听地址 listen (如 0.0.0.0:3568 或 [::]:3568): " listen
-    listen="$(_trim "$listen")"
-    validate_hostport "$listen" && break || echo "格式不正确，请输入 host:port（IPv6 需用 [::1]:443）"
+    local listen remote remark sniff http tls
+
+    while true; do
+      read -rp "监听端口/地址（直接输入端口如 3569，等价 0.0.0.0:3569；或输入完整 host:port）: " listen
+      listen="$(normalize_listen "$(_trim "$listen")")"
+      validate_hostport "$listen" && break || echo "格式不正确：请仅输入端口（如 3569）或完整的 host:port（IPv6 用 [::1]:443）"
+    done
+
+    while true; do
+      read -rp "后端地址 remote (如 127.0.0.1:8080 或 [::1]:8080): " remote
+      remote="$(_trim "$remote")"
+      validate_hostport "$remote" && break || echo "格式不正确：请输入 host:port（IPv6 用 [::1]:443）"
+    done
+
+    read -rp "sniff（默认 \"http tls\"，回车使用默认）: " sniff
+    sniff="$(_trim "${sniff:-http tls}")"
+    read -rp "http 开关（true/false，默认 false）: " http; http="$(_trim "${http:-false}")"
+    read -rp "tls  开关（true/false，默认 false）: " tls;  tls="$(_trim "${tls:-false}")"
+    read -rp "备注 remark（可留空）: " remark
+    remark="$(_trim "$remark")"
+
+    backup_file "$CONF_FILE"
+
+    {
+      echo ""
+      echo "# remark: $remark"
+      echo "[[endpoints]]"
+      echo "listen = \"${listen}\""
+      echo "remote = \"${remote}\""
+      echo "sniff  = \"${sniff}\""
+      echo "http   = ${http}"
+      echo "tls    = ${tls}"
+    } >> "$CONF_FILE"
+
+    log "已追加节点：$listen -> $remote  （remark: ${remark:-null-remark})"
+    systemctl restart "${APP_NAME}" 2>/dev/null || warn "重启服务失败，查看：journalctl -u ${APP_NAME} -e"
+
+    read -rp "需要继续添加下一个节点吗？(y/N): " yn
+    yn="${yn:-N}"; yn="${yn,,}"
+    if [[ "$yn" != "y" && "$yn" != "yes" ]]; then
+      break
+    fi
   done
-
-  while true; do
-    read -rp "后端地址 remote (如 127.0.0.1:8080 或 [::1]:8080): " remote
-    remote="$(_trim "$remote")"
-    validate_hostport "$remote" && break || echo "格式不正确，请输入 host:port（IPv6 需用 [::1]:443）"
-  done
-
-  read -rp "sniff（默认 \"http tls\"，直接回车使用默认）: " sniff
-  sniff="$(_trim "${sniff:-http tls}")"
-  read -rp "http 开关（true/false，默认 false）: " http; http="$(_trim "${http:-false}")"
-  read -rp "tls  开关（true/false，默认 false）: " tls;  tls="$(_trim "${tls:-false}")"
-  read -rp "备注 remark（可留空）: " remark
-  remark="$(_trim "$remark")"
-
-  local eid="eid-$(date +%Y%m%d-%H%M%S)-$RANDOM"
-  backup_file "$CONF_FILE"
-
-  {
-    echo ""
-    echo "# eid: $eid"
-    echo "# remark: $remark"
-    echo "[[endpoints]]"
-    echo "listen = \"${listen}\""
-    echo "remote = \"${remote}\""
-    echo "sniff  = \"${sniff}\""
-    echo "http   = ${http}"
-    echo "tls    = ${tls}"
-  } >> "$CONF_FILE"
-
-  log "已追加节点：$listen -> $remote  （remark: ${remark})"
-  systemctl restart "${APP_NAME}" 2>/dev/null || warn "重启服务失败，查看：journalctl -u ${APP_NAME} -e"
 }
 
 delete_endpoints_interactive(){
@@ -447,27 +466,45 @@ delete_endpoints_interactive(){
     fi
   done
 
-  local todelete=""
-  while IFS='|' read -r idx start end eid remark listen remote; do
+  local starts=() ends=()
+  while IFS='|' read -r idx start end remark listen remote; do
     if [[ -n "${mark[$idx]:-}" ]]; then
-      printf "将删除 #%s: %s -> %s | %s\n" "$idx" "$listen" "$remote" "$remark"
-      todelete+="${start}-${end},"
+      [[ -z "$remark" ]] && remark="null-remark"
+      command printf '将删除 #%s: %s -> %s | %s\n' "$idx" "$listen" "$remote" "$remark"
+      starts+=("$start"); ends+=("$end")
     fi
   done <<<"$rows"
 
-  [[ -n "$todelete" ]] || { echo "没有匹配的索引。"; return 1; }
+  ((${#starts[@]})) || { echo "没有匹配的索引。"; return 1; }
   read -rp "确认删除这些节点？(y/N): " yn
   [[ "${yn,,}" == "y" || "${yn,,}" == "yes" ]] || { echo "已取消。"; return 0; }
 
   backup_file "$CONF_FILE"
-  local sedexpr=()
-  IFS=',' read -ra ranges <<<"$todelete"
-  for r in "${ranges[@]}"; do
-    [[ -n "$r" ]] && sedexpr+=("-e" "${r}d")
-  done
-  if ! sed -r "${sedexpr[@]}" "$CONF_FILE" > "${CONF_FILE}.tmp.$$"; then
-    err "删除过程失败（sed）。"; rm -f "${CONF_FILE}.tmp.$$"; return 1
+
+  local starts_csv ends_csv
+  starts_csv="$(IFS=, ; echo "${starts[*]}")"
+  ends_csv="$(IFS=, ; echo "${ends[*]}")"
+
+  if ! awk -v S="$starts_csv" -v E="$ends_csv" '
+    BEGIN{
+      ns=split(S, s, /,/); ne=split(E, e, /,/);
+      for(i=1;i<=ns && i<=ne;i++){
+        ss[i]=s[i]+0; ee[i]=e[i]+0;
+        if (ee[i] < ss[i]) { tmp=ss[i]; ss[i]=ee[i]; ee[i]=tmp; }
+      }
+      n= (ns<ne?ns:ne);
+    }
+    {
+      drop=0;
+      for(i=1;i<=n;i++){
+        if (NR>=ss[i] && NR<=ee[i]) { drop=1; break; }
+      }
+      if (!drop) print $0;
+    }
+  ' "$CONF_FILE" > "${CONF_FILE}.tmp.$$"; then
+    err "删除过程失败（awk）。"; rm -f "${CONF_FILE}.tmp.$$"; return 1
   fi
+
   mv "${CONF_FILE}.tmp.$$" "$CONF_FILE"
   log "删除完成。"
   systemctl restart "${APP_NAME}" 2>/dev/null || warn "重启服务失败，查看：journalctl -u ${APP_NAME} -e"
@@ -482,35 +519,35 @@ show_status_menu(){
 }
 
 main_menu(){
-  echo
-  echo "==== ${APP_NAME} 管理 ===="
-  echo "1) 全新安装 / 首次安装"
-  echo "2) 升级（仅覆盖二进制，保留配置）【推荐】"
-  echo "3) 升级（覆盖二进制 + 覆盖配置为模板）"
-  echo "4) 卸载（可选是否保留配置）"
-  echo "5) 查看状态（含节点列表）"
-  echo "6) 添加转发节点（带备注）"
-  echo "7) 删除/批量删除转发节点（显示备注）"
-  echo "8) 列出所有转发节点（带备注）"
-  echo "q) 退出"
-  read -rp "请选择: " op
-  case "$op" in
-    1) install_fresh ;;
-    2) upgrade_inplace "no" ;;
-    3) upgrade_inplace "yes" ;;
-    4)
-      echo "  1) 卸载程序（保留 /etc/realm 配置）"
-      echo "  2) 卸载程序（并删除 /etc/realm 配置）"
-      read -rp "[1/2, 默认1]: " c; c="${c:-1}"
-      [[ "$c" == "2" ]] && uninstall_keep_or_purge "yes" || uninstall_keep_or_purge "no"
-      ;;
-    5) show_status_menu ;;
-    6) add_endpoint_interactive ;;
-    7) delete_endpoints_interactive ;;
-    8) show_endpoints_interactive ;;
-    q|Q) exit 0 ;;
-    *) warn "无效选择";;
-  esac
+  while true; do
+    echo
+    echo "==== ${APP_NAME} 管理 ===="
+    echo "1) 全新安装 / 首次安装"
+    echo "2) 升级（仅覆盖二进制，保留配置）【推荐】"
+    echo "3) 升级（覆盖二进制 + 覆盖配置为模板）"
+    echo "4) 卸载（可选是否保留配置）"
+    echo "5) 查看状态（含节点列表）"
+    echo "6) 添加转发节点（带备注）"
+    echo "7) 删除/批量删除转发节点（显示备注）"
+    echo "q) 退出"
+    read -rp "请选择: " op
+    case "$op" in
+      1) install_fresh ;;
+      2) upgrade_inplace "no" ;;
+      3) upgrade_inplace "yes" ;;
+      4)
+        echo "  1) 卸载程序（保留 /etc/realm 配置）"
+        echo "  2) 卸载程序（并删除 /etc/realm 配置）"
+        read -rp "[1/2, 默认1]: " c; c="${c:-1}"
+        [[ "$c" == "2" ]] && uninstall_keep_or_purge "yes" || uninstall_keep_or_purge "no"
+        ;;
+      5) show_status_menu ;;
+      6) add_endpoint_interactive ;;
+      7) delete_endpoints_interactive ;;
+      q|Q) break ;;
+      *) warn "无效选择";;
+    esac
+  done
 }
 
 # ===== 参数解析（非交互模式） =====
