@@ -1,99 +1,102 @@
 #!/usr/bin/env bash
-# realm 安装/升级/卸载 管理脚本（修正版0907）
-# - 修复 write_service() 空实现 / safe_enable 未定义
-# - 支持再次运行进行“就地覆盖升级”，可选择是否覆盖配置
-# - 幂等可重复运行，带备份与回滚
+# realm 安装/升级/卸载/节点管理 脚本（稳定版 v3.4）
+# 变更（相对 v3.3）：
+# - 修复 parse_endpoints()：只挂载“紧邻注释”给对应块，且不误判其他 [[table]]
+# - 支持 IPv6 host:port 形式（如 [::1]:443）
+# - 交互输入统一 trim 去空格
+# - CURL_OPTS 的 -4 选项按需追加，避免空参数
+# - 删除区间解析更稳固（支持倒序 7-5）
+#
+# 主要特性：
+# - systemd 前台运行（Type=simple，无 -d），杜绝重启环
+# - 镜像优先（ghfast -> gh-proxy -> fastgit -> 官方），下载多重校验
+# - 幂等：备份、差异更新 unit、清理残留、可重复运行
+# - 支持交互菜单与非交互参数：
+#     --install
+#     --upgrade --keep-config
+#     --upgrade --reset-config
+#     --uninstall [--purge]
+#     --status
+#
+# 环境变量：
+#   REALM_FORCE_IPV4=1
+#   REALM_MAXTIME=45
+#   REALM_SPEED_LIMIT=16384
+#   REALM_SPEED_TIME=15
+# ======================================================
 
 set -Eeuo pipefail
 
-# ========== 全局变量 ==========
 APP_NAME="realm"
 BIN_DIR="/usr/local/bin"
 BIN_PATH="${BIN_DIR}/${APP_NAME}"
 CONF_DIR="/etc/${APP_NAME}"
 CONF_FILE="${CONF_DIR}/config.toml"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
-TMP_DIR=""
-TS="$(date +%F-%H%M%S)"
+LOG_FILE="/var/log/realm.log"
 
-# 下载来源（依次尝试，避免单点）
+TS="$(date +%F-%H%M%S)"
+TMP_DIR=""
+TGZ_PATH=""
+STAGED_BIN=""
+
 ASSET_X86="realm-x86_64-unknown-linux-gnu.tar.gz"
 ASSET_ARM="realm-aarch64-unknown-linux-gnu.tar.gz"
-GITHUB_DL="https://github.com/zhboner/realm/releases/latest/download"
+
 MIRRORS=(
-  "$GITHUB_DL"                          # 官方
-  "https://ghfast.top/$GITHUB_DL"       # 加速镜像1
-  "https://download.fastgit.org/zhboner/realm/releases/latest/download"  # 加速镜像2
+  "https://ghfast.top/https://github.com/zhboner/realm/releases/latest/download"
+  "https://gh-proxy.com/https://github.com/zhboner/realm/releases/latest/download"
+  "https://download.fastgit.org/zhboner/realm/releases/latest/download"
+  "https://github.com/zhboner/realm/releases/latest/download"
 )
 
-# ========== 工具函数 ==========
-log() { printf "\033[1;32m[i]\033[0m %s\n" "$*"; }
-warn(){ printf "\033[1;33m[!]\033[0m %s\n" "$*"; }
-err() { printf "\033[1;31m[x]\033[0m %s\n" "$*" >&2; }
+CURL_CONNECT_TIMEOUT="${CURL_CONNECT_TIMEOUT:-8}"
+REALM_MAXTIME="${REALM_MAXTIME:-45}"
+REALM_SPEED_LIMIT="${REALM_SPEED_LIMIT:-16384}"
+REALM_SPEED_TIME="${REALM_SPEED_TIME:-15}"
+CURL_FORCE_IPv4_OPTS=""
+if [[ "${REALM_FORCE_IPV4:-0}" == "1" ]]; then
+  CURL_FORCE_IPv4_OPTS="-4"
+fi
+CURL_OPTS=(-fL --retry 1 --connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${REALM_MAXTIME}" --speed-limit "${REALM_SPEED_LIMIT}" --speed-time "${REALM_SPEED_TIME}")
+if [[ -n "${CURL_FORCE_IPv4_OPTS}" ]]; then
+  CURL_OPTS+=("${CURL_FORCE_IPv4_OPTS}")
+fi
 
-require_root(){
-  if [[ $EUID -ne 0 ]]; then
-    err "请以 root 运行（sudo -i 后执行）。"
-    exit 1
-  fi
-}
+log()  { printf "\033[1;32m[i]\033[0m %s\n" "$*" >&2; }
+warn() { printf "\033[1;33m[!]\033[0m %s\n" "$*" >&2; }
+err()  { printf "\033[1;31m[x]\033[0m %s\n" "$*" >&2; }
+
+require_root(){ [[ $EUID -eq 0 ]] || { err "请以 root 运行（sudo -i 后执行）。"; exit 1; }; }
 
 cleanup(){
-  if [[ -n "${TMP_DIR}" && -d "${TMP_DIR}" ]]; then
-    rm -rf "${TMP_DIR}" || true
-  fi
+  [[ -n "${TMP_DIR}"  && -d "${TMP_DIR}"  ]] && rm -rf "${TMP_DIR}"  || true
+  [[ -n "${TGZ_PATH}" && -f "${TGZ_PATH}" ]] && rm -f  "${TGZ_PATH}" || true
 }
 trap cleanup EXIT
 
-detect_arch_asset(){
-  local arch
-  arch="$(uname -m)"
-  case "$arch" in
-    x86_64|amd64) echo "$ASSET_X86" ;;
-    aarch64|arm64) echo "$ASSET_ARM" ;;
-    *)
-      err "暂不支持架构：$arch"
-      exit 2
-      ;;
-  esac
-}
-
 ensure_cmds(){
-  local need=(curl tar install)
+  local need=(curl tar install file gzip awk sed grep nc ss systemctl)
   local miss=()
-  for c in "${need[@]}"; do
-    command -v "$c" >/dev/null 2>&1 || miss+=("$c")
-  done
+  for c in "${need[@]}"; do command -v "$c" >/dev/null 2>&1 || miss+=("$c"); done
   if ((${#miss[@]})); then
     warn "缺少依赖：${miss[*]}，尝试自动安装"
     if command -v apt-get >/dev/null 2>&1; then
-      apt-get update -y && apt-get install -y curl tar coreutils || {
-        err "自动安装失败，请手动安装：${miss[*]}"
-        exit 3
-      }
+      apt-get update -y && apt-get install -y curl tar coreutils file gzip gawk sed grep netcat-openbsd iproute2 systemd || { err "依赖安装失败"; exit 3; }
     else
-      err "当前发行版不支持自动装依赖，请手动安装：${miss[*]}"
-      exit 3
+      err "非 Debian/Ubuntu 系需手动安装：${miss[*]}"; exit 3
     fi
   fi
 }
 
-backup_file(){
-  local f="$1"
-  [[ -f "$f" ]] || return 0
-  cp -a "$f" "${f}.bak.${TS}"
-  log "已备份：$f -> ${f}.bak.${TS}"
-}
+backup_file(){ local f="$1"; [[ -e "$f" ]] || return 0; cp -a "$f" "${f}.bak.${TS}"; log "已备份：$f -> ${f}.bak.${TS}"; }
 
 current_version(){
-  # 尽量兼容不同版本输出方式
   if [[ -x "$BIN_PATH" ]]; then
-    (
-      set +e
+    ( set +e
       "$BIN_PATH" -v 2>/dev/null && exit 0
       "$BIN_PATH" -V 2>/dev/null && exit 0
       "$BIN_PATH" version 2>/dev/null && exit 0
-      # 兜底：打印文件hash
       sha256sum "$BIN_PATH" 2>/dev/null | awk '{print "sha256:"$1}'
     )
   else
@@ -101,57 +104,68 @@ current_version(){
   fi
 }
 
-dl_asset(){
-  local asset="$1"
+detect_asset(){
+  case "$(uname -m)" in
+    x86_64|amd64) echo "$ASSET_X86" ;;
+    aarch64|arm64) echo "$ASSET_ARM" ;;
+    *) err "暂不支持架构：$(uname -m)"; exit 2 ;;
+  esac
+}
+
+prepare_paths(){
   TMP_DIR="$(mktemp -d)"
-  local out="${TMP_DIR}/realm.tgz"
+  TGZ_PATH="${TMP_DIR}/realm.tgz"
+  STAGED_BIN="${TMP_DIR}/realm"
+}
+
+download_and_verify(){ # 0 成功 / 1 失败
+  local asset="$1"
+  : > "${TGZ_PATH}"
   local ok=0
   for base in "${MIRRORS[@]}"; do
     local url="${base}/${asset}"
-    log "尝试下载：$url"
-    if curl -fL --connect-timeout 10 --retry 2 -o "$out" "$url"; then
+    log "尝试下载：${url}"
+    rm -f "${TGZ_PATH}" || true
+    if curl "${CURL_OPTS[@]}" -o "${TGZ_PATH}" "${url}"; then
+      if [[ ! -s "${TGZ_PATH}" ]]; then warn "下载到空文件，切下一个镜像……"; continue; fi
+      if ! file -b "${TGZ_PATH}" | grep -iq 'gzip'; then warn "文件类型异常（非 gzip），切下一个镜像……"; continue; fi
+      if ! gzip -t "${TGZ_PATH}" >/dev/null 2>&1; then warn "gzip 校验失败，切下一个镜像……"; continue; fi
+      if ! tar -tzf "${TGZ_PATH}" >/dev/null 2>&1; then warn "tar 目录校验失败，切下一个镜像……"; continue; fi
       ok=1; break
     else
-      warn "下载失败：$url"
+      warn "下载失败：${url}"
     fi
   done
-  if [[ $ok -ne 1 ]]; then
-    err "所有镜像下载失败，请检查网络后重试。"
-    exit 4
-  fi
-  echo "$out"
+  if [[ $ok -ne 1 ]]; then err "所有镜像下载/校验均失败。"; return 1; fi
+  return 0
 }
 
-extract_and_stage(){
-  local tgz="$1"
-  tar -xzf "$tgz" -C "$TMP_DIR"
-  [[ -f "${TMP_DIR}/realm" ]] || { err "压缩包内未发现 realm 可执行文件"; exit 5; }
-  echo "${TMP_DIR}/realm"
+extract_stage(){ # 0 成功 / 1 失败
+  if ! tar -xzf "${TGZ_PATH}" -C "${TMP_DIR}"; then err "解包失败：${TGZ_PATH}"; return 1; fi
+  if [[ ! -f "${STAGED_BIN}" ]]; then err "压缩包内未发现 realm 可执行文件"; return 1; fi
+  chmod +x "${STAGED_BIN}" || true
+  return 0
 }
 
 write_default_config(){
   mkdir -p "$CONF_DIR"
   if [[ ! -s "$CONF_FILE" ]]; then
     cat >"$CONF_FILE" <<'EOF'
-# /etc/realm/config.toml 示例（请按需修改）
-# 文档参考：https://github.com/zhboner/realm
-# 典型入站/出站中继配置：
+# /etc/realm/config.toml（示例模板，请按需修改）
 # [[endpoints]]
-# listen = "0.0.0.0:443"
-# remote = "127.0.0.1:8443"
-# # sniff = "http tls"
-# # http=false
-# # tls=false
-
+# listen = "0.0.0.0:3568"
+# remote = "127.0.0.1:8080"
+# sniff  = "http tls"
+# http   = false
+# tls    = false
 EOF
-    log "已生成默认配置：$CONF_FILE（当前为空模板，后续请自行填充）"
+    log "已生成默认配置：$CONF_FILE（模板）"
   else
     log "保留现有配置：$CONF_FILE"
   fi
 }
 
 write_service(){
-  # 幂等：若存在且无变化则不改；若存在且不同则备份后覆盖
   local unit_content
   read -r -d '' unit_content <<EOF || true
 [Unit]
@@ -160,11 +174,13 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=${BIN_PATH} -c ${CONF_FILE} -d
+Type=simple
+ExecStart=${BIN_PATH} -c ${CONF_FILE}
 Restart=always
 RestartSec=3
 WorkingDirectory=/root
 LimitNOFILE=1048576
+KillMode=mixed
 
 [Install]
 WantedBy=multi-user.target
@@ -188,129 +204,85 @@ EOF
 daemon_reload(){ systemctl daemon-reload || true; }
 
 safe_enable(){
-  # 幂等：enable/启动失败不致命，但会提示
+  pkill -x "${APP_NAME}" 2>/dev/null || true
   daemon_reload
-  if systemctl is-enabled --quiet "${APP_NAME}" 2>/dev/null; then
-    log "服务已 enable：${APP_NAME}.service"
-  else
-    if systemctl enable "${APP_NAME}" 2>/dev/null; then
-      log "已 enable：${APP_NAME}.service"
-    else
-      warn "enable 失败，请手动执行：systemctl enable ${APP_NAME}"
-    fi
-  fi
-
+  systemctl enable "${APP_NAME}" 2>/dev/null || warn "enable 失败，可手动：systemctl enable ${APP_NAME}"
   if systemctl is-active --quiet "${APP_NAME}" 2>/dev/null; then
-    if systemctl restart "${APP_NAME}" 2>/dev/null; then
-      log "已重启：${APP_NAME}.service"
-    else
-      warn "restart 失败，请检查日志：journalctl -u ${APP_NAME} -e"
-    fi
+    systemctl restart "${APP_NAME}" 2>/dev/null || warn "restart 失败：journalctl -u ${APP_NAME} -e"
   else
-    if systemctl start "${APP_NAME}" 2>/dev/null; then
-      log "已启动：${APP_NAME}.service"
-    else
-      warn "start 失败，请检查日志：journalctl -u ${APP_NAME} -e"
-    fi
+    systemctl start "${APP_NAME}" 2>/dev/null || warn "start 失败：journalctl -u ${APP_NAME} -e"
   fi
 }
 
 install_binary(){
-  local staged="$1"
   mkdir -p "$BIN_DIR"
-  if [[ -x "$BIN_PATH" ]]; then
-    backup_file "$BIN_PATH"
-  fi
-  install -m 0755 "$staged" "$BIN_PATH"
+  [[ -x "$BIN_PATH" ]] && backup_file "$BIN_PATH"
+  install -m 0755 "${STAGED_BIN}" "$BIN_PATH"
   log "已安装二进制：$BIN_PATH"
 }
 
 install_fresh(){
-  # 全新安装（不删已有配置，仅生成默认配置）
-  local asset tgz staged
-  asset="$(detect_arch_asset)"
-  tgz="$(dl_asset "$asset")"
-  staged="$(extract_and_stage "$tgz")"
-
+  local asset; asset="$(detect_asset)"
+  prepare_paths
+  download_and_verify "$asset" || exit 4
+  extract_stage || exit 5
   write_default_config
-  install_binary "$staged"
+  install_binary
   write_service
   safe_enable
-
   log "安装完成。当前版本：$(current_version)"
 }
 
 upgrade_inplace(){
-  # 升级二进制，是否覆盖配置由参数决定
   local overwrite_conf="${1:-no}"  # yes/no
-  local asset tgz staged
-
   if [[ ! -x "$BIN_PATH" ]]; then
     warn "检测到未安装 ${APP_NAME}，将执行全新安装。"
-    install_fresh
-    return
+    install_fresh; return
   fi
-
   log "当前已安装版本：$(current_version)"
   systemctl stop "${APP_NAME}" 2>/dev/null || true
 
-  asset="$(detect_arch_asset)"
-  tgz="$(dl_asset "$asset")"
-  staged="$(extract_and_stage "$tgz")"
+  local asset; asset="$(detect_asset)"
+  prepare_paths
+  download_and_verify "$asset" || exit 4
+  extract_stage || exit 5
 
-  # 配置处理
   mkdir -p "$CONF_DIR"
   if [[ "$overwrite_conf" == "yes" ]]; then
     backup_file "$CONF_FILE"
     cat >"$CONF_FILE" <<'EOF'
-# /etc/realm/config.toml （已重置为模板，请按需修改）
+# /etc/realm/config.toml （已重置为模板）
 # [[endpoints]]
-# listen = "0.0.0.0:443"
-# remote = "127.0.0.1:8443"
+# listen = "0.0.0.0:3568"
+# remote = "127.0.0.1:8080"
+# sniff  = "http tls"
+# http   = false
+# tls    = false
 EOF
     log "已覆盖配置：$CONF_FILE（模板）"
   else
-    write_default_config  # 仅在缺省时生成，不会覆盖
+    write_default_config
   fi
 
-  install_binary "$staged"
+  install_binary
   write_service
   safe_enable
-
-  log "升级完成。当前版本：$(current_version)"
+  log "升级完成。当前版本：$(current版本)"
 }
 
 uninstall_keep_or_purge(){
-  # 选择保留配置或彻底清理
-  echo
-  echo "请选择卸载方式："
-  echo "  1) 卸载程序（保留 /etc/realm 配置）"
-  echo "  2) 卸载程序（并删除 /etc/realm 配置）"
-  read -rp "[1/2, 默认1]: " choice
-  choice="${choice:-1}"
-
+  local purge="${1:-no}"  # yes/no
   systemctl stop "${APP_NAME}" 2>/dev/null || true
   systemctl disable "${APP_NAME}" 2>/dev/null || true
 
-  if [[ -x "$BIN_PATH" ]]; then
-    backup_file "$BIN_PATH"
-    rm -f "$BIN_PATH"
-    log "已移除二进制：$BIN_PATH"
-  fi
+  [[ -x "$BIN_PATH" ]] && { backup_file "$BIN_PATH"; rm -f "$BIN_PATH"; log "已移除二进制：$BIN_PATH"; }
 
   if [[ -f "$SERVICE_FILE" ]]; then
-    backup_file "$SERVICE_FILE"
-    rm -f "$SERVICE_FILE"
-    log "已移除 systemd 单元：$SERVICE_FILE"
-    daemon_reload
+    backup_file "$SERVICE_FILE"; rm -f "$SERVICE_FILE"; log "已移除 systemd 单元：$SERVICE_FILE"; daemon_reload
   fi
 
-  if [[ "$choice" == "2" ]]; then
-    if [[ -d "$CONF_DIR" ]]; then
-      backup_file "$CONF_DIR"
-      rm -rf "$CONF_DIR"
-      log "已删除配置目录：$CONF_DIR（备份已留存）"
-    fi
+  if [[ "$purge" == "yes" ]]; then
+    [[ -d "$CONF_DIR" ]] && { backup_file "$CONF_DIR"; rm -rf "$CONF_DIR"; log "已删除配置目录：$CONF_DIR（备份已留存）"; }
   else
     log "保留配置目录：$CONF_DIR"
   fi
@@ -325,6 +297,193 @@ show_status(){
   echo "服务：$SERVICE_FILE $( systemctl is-active --quiet "${APP_NAME}" && echo '(active)' || echo '(inactive)' )"
 }
 
+# =================== 节点管理 ===================
+
+ensure_config(){
+  mkdir -p "$CONF_DIR"
+  [[ -f "$CONF_FILE" ]] || write_default_config
+}
+
+# 解析并列出所有 [[endpoints]] 块，输出：idx|start|end|eid|remark|listen|remote
+parse_endpoints(){
+  ensure_config
+  awk '
+    BEGIN{
+      idx=0; inblk=0; start=0
+      eid=""; remark=""; listen=""; remote=""
+      pend_eid=""; pend_remark=""
+    }
+    function Trim(s){ sub(/^[ \t\r\n]+/,"",s); sub(/[ \t\r\n]+$/,"",s); return s }
+    function flush_block(endline){
+      if(inblk){
+        idx++
+        printf("%d|%d|%d|%s|%s|%s|%s\n", idx, start, endline, eid, remark, listen, remote)
+      }
+      inblk=0; start=0; eid=""; remark=""; listen=""; remote=""
+    }
+    {
+      line=$0
+      if (match(line, /^[ \t]*#\s*eid:[ \t]*(.*)$/, m))   { pend_eid   = Trim(m[1]); next }
+      if (match(line, /^[ \t]*#\s*remark:[ \t]*(.*)$/, m)){ pend_remark= Trim(m[1]); next }
+
+      if (match(line, /^[ \t]*\[\[endpoints\]\][ \t]*$/)) {
+        if (inblk) flush_block(NR-1)
+        inblk=1; start=NR
+        eid=pend_eid; remark=pend_remark
+        listen=""; remote=""
+        pend_eid=""; pend_remark=""
+        next
+      }
+
+      if (inblk) {
+        if (match(line, /^[ \t]*listen[ \t]*=[ \t]*"(.*)"/, m)) { listen = Trim(m[1]) }
+        if (match(line, /^[ \t]*remote[ \t]*=[ \t]*"(.*)"/, m)) { remote = Trim(m[1]) }
+        if (match(line, /^[ \t]*\[\[.*\]\]/)) {
+          flush_block(NR-1); inblk=0
+        }
+        next
+      }
+
+      if (line !~ /^[ \t]*#/) { pend_eid=""; pend_remark="" }
+    }
+    END{
+      if (inblk) flush_block(NR)
+    }
+  ' "$CONF_FILE"
+}
+
+list_endpoints(){
+  local rows
+  rows="$(parse_endpoints || true)"
+  if [[ -z "$rows" ]]; then
+    echo "（暂无 [[endpoints]] 节点）"
+    return 0
+  fi
+  printf "Idx  Listen                      -> Remote                     | Remark\n"
+  printf "---- ---------------------------- ---------------------------- | -----------------------------\n"
+  while IFS='|' read -r idx start end eid remark listen remote; do
+    printf "%-4s %-28s -> %-28s | %s\n" "$idx" "${listen:-"-"}" "${remote:-"-"}" "${remark:-""}"
+  done <<<"$rows"
+}
+
+# 支持 ipv4/域名:port 或 [ipv6]:port
+validate_hostport(){
+  local hp="$1"
+  hp="${hp#"${hp%%[![:space:]]*}"}"; hp="${hp%"${hp##*[![:space:]]}"}"
+  if [[ "$hp" =~ ^\[[0-9a-fA-F:]+\]:([0-9]{1,5})$ ]]; then
+    local port="${BASH_REMATCH[1]}"
+    ((port>=1 && port<=65535)) || return 1
+    return 0
+  fi
+  if [[ "$hp" =~ ^[^:[:space:]]+:([0-9]{1,5})$ ]]; then
+    local port="${BASH_REMATCH[1]}"
+    ((port>=1 && port<=65535)) || return 1
+    return 0
+  fi
+  return 1
+}
+
+_trim(){ local s="$*"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+
+add_endpoint_interactive(){
+  ensure_config
+  local listen remote remark sniff http tls
+
+  while true; do
+    read -rp "监听地址 listen (如 0.0.0.0:3568 或 [::]:3568): " listen
+    listen="$(_trim "$listen")"
+    validate_hostport "$listen" && break || echo "格式不正确，请输入 host:port（IPv6 需用 [::1]:443）"
+  done
+
+  while true; do
+    read -rp "后端地址 remote (如 127.0.0.1:8080 或 [::1]:8080): " remote
+    remote="$(_trim "$remote")"
+    validate_hostport "$remote" && break || echo "格式不正确，请输入 host:port（IPv6 需用 [::1]:443）"
+  done
+
+  read -rp "sniff（默认 \"http tls\"，直接回车使用默认）: " sniff
+  sniff="$(_trim "${sniff:-http tls}")"
+  read -rp "http 开关（true/false，默认 false）: " http; http="$(_trim "${http:-false}")"
+  read -rp "tls  开关（true/false，默认 false）: " tls;  tls="$(_trim "${tls:-false}")"
+  read -rp "备注 remark（可留空）: " remark
+  remark="$(_trim "$remark")"
+
+  local eid="eid-$(date +%Y%m%d-%H%M%S)-$RANDOM"
+  backup_file "$CONF_FILE"
+
+  {
+    echo ""
+    echo "# eid: $eid"
+    echo "# remark: $remark"
+    echo "[[endpoints]]"
+    echo "listen = \"${listen}\""
+    echo "remote = \"${remote}\""
+    echo "sniff  = \"${sniff}\""
+    echo "http   = ${http}"
+    echo "tls    = ${tls}"
+  } >> "$CONF_FILE"
+
+  log "已追加节点：$listen -> $remote  （remark: ${remark})"
+  systemctl restart "${APP_NAME}" 2>/dev/null || warn "重启服务失败，查看：journalctl -u ${APP_NAME} -e"
+}
+
+delete_endpoints_interactive(){
+  ensure_config
+  local rows; rows="$(parse_endpoints || true)"
+  if [[ -z "$rows" ]]; then echo "当前没有可删除的节点。"; return 0; fi
+  list_endpoints
+  echo
+  read -rp "输入要删除的索引（支持逗号和区间，如 1,3,5-7）: " sel
+  [[ -n "$sel" ]] || { echo "未输入。"; return 1; }
+
+  declare -A mark=()
+  IFS=',' read -ra parts <<<"$sel"
+  for p in "${parts[@]}"; do
+    p="${p//[[:space:]]/}"
+    if [[ "$p" =~ ^[0-9]+-[0-9]+$ ]]; then
+      local a b t i
+      a="${p%-*}"; b="${p#*-}"
+      if (( a > b )); then t="$a"; a="$b"; b="$t"; fi
+      for ((i=a; i<=b; i++)); do mark["$i"]=1; done
+    elif [[ "$p" =~ ^[0-9]+$ ]]; then
+      mark["$p"]=1
+    fi
+  done
+
+  local todelete=""
+  while IFS='|' read -r idx start end eid remark listen remote; do
+    if [[ -n "${mark[$idx]:-}" ]]; then
+      printf "将删除 #%s: %s -> %s | %s\n" "$idx" "$listen" "$remote" "$remark"
+      todelete+="${start}-${end},"
+    fi
+  done <<<"$rows"
+
+  [[ -n "$todelete" ]] || { echo "没有匹配的索引。"; return 1; }
+  read -rp "确认删除这些节点？(y/N): " yn
+  [[ "${yn,,}" == "y" || "${yn,,}" == "yes" ]] || { echo "已取消。"; return 0; }
+
+  backup_file "$CONF_FILE"
+  local sedexpr=()
+  IFS=',' read -ra ranges <<<"$todelete"
+  for r in "${ranges[@]}"; do
+    [[ -n "$r" ]] && sedexpr+=("-e" "${r}d")
+  done
+  if ! sed -r "${sedexpr[@]}" "$CONF_FILE" > "${CONF_FILE}.tmp.$$"; then
+    err "删除过程失败（sed）。"; rm -f "${CONF_FILE}.tmp.$$"; return 1
+  fi
+  mv "${CONF_FILE}.tmp.$$" "$CONF_FILE"
+  log "删除完成。"
+  systemctl restart "${APP_NAME}" 2>/dev/null || warn "重启服务失败，查看：journalctl -u ${APP_NAME} -e"
+}
+
+show_endpoints_interactive(){ list_endpoints; }
+
+show_status_menu(){
+  show_status
+  echo
+  show_endpoints_interactive
+}
+
 main_menu(){
   echo
   echo "==== ${APP_NAME} 管理 ===="
@@ -332,21 +491,63 @@ main_menu(){
   echo "2) 升级（仅覆盖二进制，保留配置）【推荐】"
   echo "3) 升级（覆盖二进制 + 覆盖配置为模板）"
   echo "4) 卸载（可选是否保留配置）"
-  echo "5) 查看状态"
+  echo "5) 查看状态（含节点列表）"
+  echo "6) 添加转发节点（带备注）"
+  echo "7) 删除/批量删除转发节点（显示备注）"
+  echo "8) 列出所有转发节点（带备注）"
   echo "q) 退出"
   read -rp "请选择: " op
   case "$op" in
     1) install_fresh ;;
     2) upgrade_inplace "no" ;;
     3) upgrade_inplace "yes" ;;
-    4) uninstall_keep_or_purge ;;
-    5) show_status ;;
+    4)
+      echo "  1) 卸载程序（保留 /etc/realm 配置）"
+      echo "  2) 卸载程序（并删除 /etc/realm 配置）"
+      read -rp "[1/2, 默认1]: " c; c="${c:-1}"
+      [[ "$c" == "2" ]] && uninstall_keep_or_purge "yes" || uninstall_keep_or_purge "no"
+      ;;
+    5) show_status_menu ;;
+    6) add_endpoint_interactive ;;
+    7) delete_endpoints_interactive ;;
+    8) show_endpoints_interactive ;;
     q|Q) exit 0 ;;
     *) warn "无效选择";;
   esac
 }
 
-# ========== 入口 ==========
+# ===== 参数解析（非交互模式） =====
+if [[ $# -gt 0 ]]; then
+  require_root
+  ensure_cmds
+  case "$1" in
+    --install) install_fresh ;;
+    --upgrade)
+      shift || true
+      if [[ "${1:-}" == "--reset-config" ]]; then
+        upgrade_inplace "yes"
+      else
+        upgrade_inplace "no"
+      fi
+      ;;
+    --uninstall)
+      shift || true
+      if [[ "${1:-}" == "--purge" ]]; then
+        uninstall_keep_or_purge "yes"
+      else
+        uninstall_keep_or_purge "no"
+      fi
+      ;;
+    --status) show_status_menu ;;
+    *)
+      err "未知参数：$*  可用：--install | --upgrade [--keep-config|--reset-config] | --uninstall [--purge] | --status"
+      exit 1
+      ;;
+  esac
+  exit 0
+fi
+
+# ===== 交互入口 =====
 require_root
 ensure_cmds
 main_menu
