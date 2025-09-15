@@ -1,6 +1,4 @@
-#!/usr/bin/env bash
-# setup_hy2_dnat_ufw_fixed.sh
-# For HY2
+#!/usr/bin/env bash # setup_hy2_dnat_ufw_fixed.sh # For HY2
 # 目标：UFW 主控 + systemd 在 UFW 之后补一条本机端口“跳端口”映射（HY2 客户端原生跳端口）
 # 改进点：修复 backports 循环分号、分离 heredoc、DNAT→REDIRECT、保留原有交互与提示
 set -euo pipefail
@@ -24,20 +22,16 @@ maybe_disable_backports() {
   for f in /etc/apt/sources.list.d/*.sources /etc/apt/sources.list; do
     [ -f "$f" ] || continue
     grep -qi backports "$f" || continue
-    awk '
-      BEGIN{IGNORECASE=1}
+    awk ' BEGIN{IGNORECASE=1}
       /^Enabled:/ { print "Enabled: no"; next }
       /^Suites:/ && $0 ~ /backports/ { print; print "Enabled: no"; next }
-      { print }
-    ' "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
+      { print } ' "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
   done
 }
 
 apt_update_smart() {
   wecho "[2/7] 更新软件源"
-  if apt-get update -y; then
-    return 0
-  fi
+  if apt-get update -y; then return 0; fi
   local codename; codename="$(detect_debian_codename)"
   if [[ "$codename" =~ ^(bookworm|trixie)$ ]]; then
     eecho "apt-get update 失败（$codename）。请检查网络/镜像源或稍后重试（不建议动 backports）。"
@@ -65,10 +59,8 @@ SSH_PORT="$(detect_ssh_port)"
 
 read -rp "HY2 监听端口（默认 ${DEFAULT_LISTEN}，仅数字）: " LISTEN_PORT
 LISTEN_PORT="${LISTEN_PORT:-$DEFAULT_LISTEN}"
-
 read -rp "端口跳跃范围（默认 ${DEFAULT_RANGE}，格式 15000:18369）: " RANGE
 RANGE="${RANGE:-$DEFAULT_RANGE}"
-
 read -rp "协议（udp/tcp，默认 ${DEFAULT_PROTO}，HY2 用 udp）: " PROTO
 PROTO="${PROTO:-$DEFAULT_PROTO}"
 
@@ -77,6 +69,12 @@ ALLOW_RANGE="n"
 read -rp "UFW 是否同时放行端口段 ${RANGE}/${PROTO}（安全面更大）？(y/N): " allow_r
 [[ "${allow_r:-N}" =~ ^[Yy]$ ]] && ALLOW_RANGE="y"
 
+# NEW: 是否安装/启用 UFW（默认 Y = 保持原有行为）
+INSTALL_UFW="y"
+read -rp "是否安装并启用 UFW 防火墙？(Y/n): " _ans_install_ufw
+[[ "${_ans_install_ufw:-Y}" =~ ^[Yy]$ ]] || INSTALL_UFW="n"
+# NEW 结束
+
 cecho "配置预览："
 echo " 系统版本 : $(. /etc/os-release 2>/dev/null; echo ${PRETTY_NAME:-unknown})"
 echo " SSH 端口 : ${SSH_PORT}/tcp"
@@ -84,7 +82,7 @@ echo " HY2 监听端口 : ${LISTEN_PORT}/${PROTO}"
 echo " 端口跳跃范围(入口): ${RANGE}/${PROTO}"
 echo " 映射方式 : PREROUTING REDIRECT → :${LISTEN_PORT}"
 echo " UFW 放行端口段 : ${ALLOW_RANGE}"
-
+echo " 安装/启用 UFW : ${INSTALL_UFW}"   # NEW: 预览增加这一项
 read -rp "确认执行？(y/N): " go
 [[ "${go:-N}" =~ ^[Yy]$ ]] || { wecho "已取消。"; exit 0; }
 
@@ -95,23 +93,33 @@ rm -f /etc/systemd/system/iptables.service /etc/systemd/system/ip6tables.service
 
 # [2/7] 更新 & 安装
 apt_update_smart
-DEBIAN_FRONTEND=noninteractive apt-get install -y ufw iptables
+# NEW: 仅在需要时安装 ufw；始终安装 iptables
+if [[ "$INSTALL_UFW" == "y" ]]; then
+  DEBIAN_FRONTEND=noninteractive apt-get install -y ufw iptables
+else
+  DEBIAN_FRONTEND=noninteractive apt-get install -y iptables
+fi
+# NEW 结束
 
 # [3/7] UFW：放行 SSH / 监听口；端口段按需放行；启用 UFW
-cecho "放行 SSH 端口：${SSH_PORT}/tcp"
-ufw allow "${SSH_PORT}"/tcp || true
+if [[ "$INSTALL_UFW" == "y" ]]; then  # NEW: 整段包裹
+  cecho "放行 SSH 端口：${SSH_PORT}/tcp"
+  ufw allow "${SSH_PORT}"/tcp || true
 
-cecho "放行 HY2 监听端口：${LISTEN_PORT}/${PROTO}"
-ufw allow "${LISTEN_PORT}/${PROTO}" comment 'HY2 listen' || true
+  cecho "放行 HY2 监听端口：${LISTEN_PORT}/${PROTO}"
+  ufw allow "${LISTEN_PORT}/${PROTO}" comment 'HY2 listen' || true
 
-if [[ "$ALLOW_RANGE" == "y" ]]; then
-  cecho "放行端口跳跃范围：${RANGE}/${PROTO}"
-  ufw allow "${RANGE}/${PROTO}" comment 'HY2 hopping range' || true
-fi
+  if [[ "$ALLOW_RANGE" == "y" ]]; then
+    cecho "放行端口跳跃范围：${RANGE}/${PROTO}"
+    ufw allow "${RANGE}/${PROTO}" comment 'HY2 hopping range' || true
+  fi
 
-wecho "启用 UFW（若已启用会跳过）"
-ufw --force enable
-systemctl enable ufw >/dev/null 2>&1 || true
+  wecho "启用 UFW（若已启用会跳过）"
+  ufw --force enable
+  systemctl enable ufw >/dev/null 2>&1 || true
+else
+  wecho "跳过 UFW 安装与配置（按你的选择）。"
+fi  # NEW 结束
 
 # [4/7] 生成 /root/hy2-dnat.sh（先清空范围内旧规则，再加一条 REDIRECT）
 wecho "[4/7] 生成 /root/hy2-dnat.sh"
@@ -147,8 +155,7 @@ TGT_PORT="${LISTEN_PORT}"
 PROTO="${PROTO}"
 EOF
 
-# [6/7] 写入 systemd 单元（独立 heredoc，避免重定向冲突）
-wecho "[6/7] 写入 /etc/systemd/system/hy2-dnat.service"
+# [6/7] systemd 服务（默认 After 里带 ufw.service；即使未安装 UFW 也不影响）
 cat >/etc/systemd/system/hy2-dnat.service <<'EOSVC'
 [Unit]
 Description=HY2 DNAT/REDIRECT rule autoloader (runs after UFW)
@@ -174,10 +181,8 @@ systemctl enable --now hy2-dnat.service
 cecho "[7/7] 验证：规则 / 监听 / 服务状态"
 echo "---- PREROUTING（应看到 REDIRECT → :${LISTEN_PORT}) ----"
 iptables -t nat -S PREROUTING | grep -E "REDIRECT|:${LISTEN_PORT}" || echo "规则未出现"
-
 echo "---- 监听状态（需 sing-box 已启动，应看到 :${LISTEN_PORT}/${PROTO}) ----"
 ss -lunp | grep -E ":${LISTEN_PORT}\b" || echo "${LISTEN_PORT}/${PROTO} 未监听（请确认 sing-box 已启动）"
-
 echo "---- 服务状态（应为 active (exited)） ----"
 systemctl status hy2-dnat.service --no-pager || true
 
