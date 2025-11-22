@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # 自动清理 doremii.top 临时网盘目录
+#给执行权限：chmod +x /root/clean_doremii_temp.sh
 # 超过 8GB 时，从最旧的文件开始删除，直到小于等于 8GB
 
 set -euo pipefail
