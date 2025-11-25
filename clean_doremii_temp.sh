@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 # 自动清理 doremii.top 临时网盘目录
-#给执行权限：chmod +x /root/clean_doremii_temp.sh
-# 超过 8GB 时，从最旧的文件开始删除，直到小于等于 8GB
+# 超过 10GB 时，从最旧的文件开始删除，直到小于等于 10GB
 
 set -euo pipefail
 
 # ★ 这里改成你真实的 temp 目录（宿主机路径）
 TEMP_DIR="/opt/1panel/www/sites/doremii.top/temp"
 
-# ★ 上限：8GB（8 * 1024^3 字节）
-MAX_BYTES=$((8 * 1024 * 1024 * 1024))
+# ★ 上限：10GB（10 * 1024^3 字节）
+MAX_BYTES=$((10 * 1024 * 1024 * 1024))
 
 # 日志（可选，不想要可以把 LOG_FILE 设为空字符串 ""）
 LOG_FILE="/var/log/clean_doremii_temp.log"
@@ -60,4 +59,3 @@ while [[ "$current_size" -gt "$MAX_BYTES" ]]; do
 done
 
 log "清理完成，当前目录大小：${current_size} bytes"
-
