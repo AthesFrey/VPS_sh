@@ -1,3 +1,4 @@
+cat > /root/thiao-rdp-nat.sh <<'EOF'
 #!/usr/bin/env bash
 # thiao-rdp-nat.sh — 固化 8097 -> thiao:3389 DNAT，自动探测来宾 IP（libvirt default NAT）
 # 需求：root 运行；宿主为 iptables-nft；libvirt 已安装；建议开启 ip_forward 持久化
@@ -20,12 +21,25 @@ command -v iptables >/dev/null || { echo "[ERR] iptables not found"; exit 1; }
 
 echo "[INF] === thiao-rdp-nat start ==="
 
-# 1) 等待 libvirtd 与网络就绪；确保 default 网络启动
+# 1) 等待 libvirtd 与网络就绪；确保 default 网络启动（修复：避免 already active 时报错退出/避免本地化导致误判）
 until systemctl is-active --quiet libvirtd; do sleep 1; done
-if ! virsh net-info "$NET_NAME" 2>/dev/null | grep -q "Active:.*yes"; then
+
+export LC_ALL=C
+export LANG=C
+
+is_net_active() {
+  virsh net-info "$NET_NAME" 2>/dev/null | awk -F': *' '/^Active:/{print tolower($2)}' | grep -qx "yes"
+}
+
+if ! is_net_active; then
   echo "[INF] Starting libvirt network: $NET_NAME"
-  virsh net-start "$NET_NAME" >/dev/null
+  # 修复点：stderr 也吞掉；并且即使遇到“already active”的竞态，也不中断脚本
+  virsh net-start "$NET_NAME" >/dev/null 2>&1 || true
 fi
+
+# 再确认一次：如果最后还是没 active，才算真失败
+is_net_active || { echo "[ERR] libvirt network '$NET_NAME' is not active."; exit 1; }
+
 virbr_if=$(virsh net-info "$NET_NAME" | awk -F': *' '/Bridge name/{print $2}')
 : "${virbr_if:=virbr0}"
 
@@ -98,3 +112,7 @@ echo "[OK] DNAT ${HOST_RDP_PORT} -> ${GUEST_IP}:${GUEST_RDP_PORT}"
 # 10) 小自检：打印命中计数
 iptables -t nat -L PREROUTING -n -v | awk '/tcp dpt:'"${HOST_RDP_PORT}"'/{print "[CNT] PREROUTING hits:",$1,$2}'
 echo "[INF] === thiao-rdp-nat done ==="
+EOF
+
+chmod +x /root/thiao-rdp-nat.sh
+/root/thiao-rdp-nat.sh
