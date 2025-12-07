@@ -1,4 +1,6 @@
-#!/usr/bin/env bash # setup_hy2_dnat_ufw_fixed.sh # For HY2
+#!/usr/bin/env bash
+# setup_hy2_dnat_ufw_fixed.sh
+# For HY2
 # 目标：UFW 主控 + systemd 在 UFW 之后补一条本机端口“跳端口”映射（HY2 客户端原生跳端口）
 # 改进点：修复 backports 循环分号、分离 heredoc、DNAT→REDIRECT、保留原有交互与提示
 set -euo pipefail
@@ -121,7 +123,7 @@ else
   wecho "跳过 UFW 安装与配置（按你的选择）。"
 fi  # NEW 结束
 
-# [4/7] 生成 /root/hy2-dnat.sh（先清空范围内旧规则，再加一条 REDIRECT）
+# [4/7] 生成 /root/hy2-dnat.sh（幂等：运行多次也不会重复）
 wecho "[4/7] 生成 /root/hy2-dnat.sh"
 cat >/root/hy2-dnat.sh <<'EOSH'
 #!/usr/bin/env bash
@@ -130,20 +132,21 @@ RANGE="${RANGE:-15000:18369}"
 TGT_PORT="${TGT_PORT:-2567}"
 PROTO="${PROTO:-udp}"
 
-# 删除该端口段上的所有 REDIRECT/DNAT（行号倒序删除更稳妥）
-mapfile -t LNS < <(iptables -t nat -L PREROUTING -n --line-numbers | awk '/(REDIRECT|DNAT)/ && /dpt:'"$RANGE"'/{print $1}')
-for (( idx=${#LNS[@]}-1; idx>=0; idx-- )); do
-  ln="${LNS[$idx]}"
-  [ -n "$ln" ] && iptables -t nat -D PREROUTING "$ln" || true
+# 只管理“自己这条规则”（带 comment），避免误删别的 NAT 规则
+RULE=( -p "$PROTO" -m "$PROTO" --dport "$RANGE"
+       -m comment --comment "HY2 REDIRECT autoload"
+       -j REDIRECT --to-ports "$TGT_PORT" )
+
+# 1) 先把完全相同的规则全部删掉（可清掉重复的 2 条/3 条/更多）
+while iptables -w 3 -t nat -C PREROUTING "${RULE[@]}" 2>/dev/null; do
+  iptables -w 3 -t nat -D PREROUTING "${RULE[@]}" || break
 done
 
-# 重新加一条带标记的本机端口重定向（更通用）
-iptables -t nat -A PREROUTING -p "$PROTO" --dport "$RANGE" \
-  -m comment --comment "HY2 REDIRECT autoload" \
-  -j REDIRECT --to-ports "$TGT_PORT"
+# 2) 再加回 1 条（保证最终只有 1 条）
+iptables -w 3 -t nat -A PREROUTING "${RULE[@]}"
 
 # 打印当前规则以便核对
-iptables -t nat -S PREROUTING | grep -E 'REDIRECT|DNAT|HY2 (REDIRECT|DNAT) autoload' || true
+iptables -t nat -S PREROUTING | grep -E 'HY2 REDIRECT autoload' || true
 EOSH
 chmod 700 /root/hy2-dnat.sh
 
@@ -188,3 +191,5 @@ systemctl status hy2-dnat.service --no-pager || true
 
 cecho "完成 ✅"
 wecho "提示：云厂商安全组需放行 ${RANGE}/${PROTO} 入站；客户端启用 server_ports（如 \"15000-18369\"）与 hop_interval。"
+
+
