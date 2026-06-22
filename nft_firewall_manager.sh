@@ -3,26 +3,50 @@
 set -e
 
 CONF="/etc/nftables.conf"
+BACKUP_DIR="/etc/nftables.backup"
 
-DEFAULT_PORTS_TCP=(22 80 443)
+mkdir -p "$BACKUP_DIR"
 
+# =========================
+# DEFAULT PROTECTION PORTS
+# =========================
+DEFAULT_TCP_PORTS=(22 80 443)
+
+# =========================
+# TOOLS
+# =========================
 ensure_nft() {
-    if ! command -v nft >/dev/null 2>&1; then
-        echo "[+] Installing nftables..."
+    command -v nft >/dev/null 2>&1 || {
         apt update -y
         apt install -y nftables
-    fi
+    }
 }
 
-backup_conf() {
-    if [ -f "$CONF" ]; then
-        cp "$CONF" "$CONF.bak.$(date +%F-%H%M%S)"
-    fi
+backup() {
+    cp "$CONF" "$BACKUP_DIR/nftables.conf.$(date +%F-%H%M%S)" 2>/dev/null || true
 }
 
-build_ruleset() {
-    TCP_PORTS=$(get_ports tcp)
-    UDP_PORTS=$(get_ports udp)
+get_ports() {
+    TYPE="$1"
+    FILE="/etc/nft_ports_${TYPE}.list"
+
+    # ensure file exists
+    touch "$FILE"
+
+    # read + clean
+    PORTS=$(cat "$FILE" | grep -E '^[0-9]+$' | sort -n | uniq)
+
+    echo "$PORTS"
+}
+
+build_rules() {
+    TCP=$(get_ports tcp)
+    UDP=$(get_ports udp)
+
+    # merge defaults into TCP
+    TCP_ALL=$(printf "%s\n" "${DEFAULT_TCP_PORTS[@]}" "$TCP" | grep -E '^[0-9]+$' | sort -n | uniq | paste -sd "," -)
+
+    UDP_ALL=$(echo "$UDP" | tr '\n' ',' | sed 's/,$//')
 
     cat > "$CONF" <<EOF
 #!/usr/sbin/nft -f
@@ -38,8 +62,17 @@ table inet filter {
         ct state established,related accept
         ct state invalid drop
 
-        tcp dport {${TCP_PORTS}} accept
-        udp dport {${UDP_PORTS}} accept
+        # TCP ports (always safe, never empty)
+        tcp dport {${TCP_ALL}} accept
+
+EOF
+
+    # only add UDP if not empty
+    if [ -n "$UDP_ALL" ]; then
+        echo "        udp dport {${UDP_ALL}} accept" >> "$CONF"
+    fi
+
+    cat >> "$CONF" <<EOF
 
         ip protocol icmp accept
         ip6 nexthdr icmpv6 accept
@@ -62,124 +95,97 @@ table inet filter {
 EOF
 }
 
-get_ports() {
-    TYPE="$1"
-    FILE="/etc/nft_ports_$TYPE.list"
-
-    if [ ! -f "$FILE" ]; then
-        if [ "$TYPE" = "tcp" ]; then
-            echo "${DEFAULT_PORTS_TCP[*]}" | tr ' ' ','
-        else
-            echo ""
-        fi
-        return
-    fi
-
-    paste -sd "," "$FILE"
-}
-
-save_ports() {
-    TYPE="$1"
-    FILE="/etc/nft_ports_$TYPE.list"
-    shift
-    echo "$@" | tr ' ' '\n' | sort -n | uniq > "$FILE"
-}
-
-show_ports() {
-    echo "=== TCP Ports ==="
-    cat /etc/nft_ports_tcp.list 2>/dev/null || echo "22 80 443 (default)"
-    echo "=== UDP Ports ==="
-    cat /etc/nft_ports_udp.list 2>/dev/null || echo "none"
-}
-
-add_port() {
-    read -p "TCP or UDP? (t/u): " proto
-    read -p "Port number: " port
-
-    if [[ "$proto" == "t" ]]; then
-        FILE="/etc/nft_ports_tcp.list"
-    else
-        FILE="/etc/nft_ports_udp.list"
-    fi
-
-    touch "$FILE"
-    echo "$port" >> "$FILE"
-    sort -n "$FILE" | uniq > "$FILE"
-
-    echo "[+] Added $port to $proto"
-}
-
-remove_port() {
-    read -p "TCP or UDP? (t/u): " proto
-    read -p "Port number to remove: " port
-
-    if [[ "$proto" == "t" ]]; then
-        FILE="/etc/nft_ports_tcp.list"
-    else
-        FILE="/etc/nft_ports_udp.list"
-    fi
-
-    if [ -f "$FILE" ]; then
-        grep -v "^$port$" "$FILE" > tmp && mv tmp "$FILE"
-        echo "[+] Removed $port"
-    else
-        echo "No such list"
-    fi
+validate() {
+    nft -c -f "$CONF"
 }
 
 apply() {
-    build_ruleset
-    systemctl enable nftables >/dev/null 2>&1 || true
-    systemctl restart nftables
+    backup
+    build_rules
 
-    echo "[+] nftables applied"
-    nft list ruleset
+    if validate; then
+        systemctl enable nftables >/dev/null 2>&1 || true
+        systemctl restart nftables
+        echo "[OK] nftables applied safely"
+    else
+        echo "[ERROR] invalid config, rollback"
+        latest=$(ls -t $BACKUP_DIR/*.conf* 2>/dev/null | head -1)
+        [ -n "$latest" ] && cp "$latest" "$CONF"
+        systemctl restart nftables || true
+        exit 1
+    fi
+}
+
+show_ports() {
+    echo "=== TCP ==="
+    cat /etc/nft_ports_tcp.list 2>/dev/null || true
+    echo "=== UDP ==="
+    cat /etc/nft_ports_udp.list 2>/dev/null || true
+}
+
+add_port() {
+    read -p "tcp or udp? (t/u): " proto
+    read -p "port: " port
+
+    FILE="/etc/nft_ports_${proto}cp.list"
+    if [ "$proto" = "t" ]; then
+        FILE="/etc/nft_ports_tcp.list"
+    else
+        FILE="/etc/nft_ports_udp.list"
+    fi
+
+    echo "$port" >> "$FILE"
+    sort -n "$FILE" | uniq > tmp && mv tmp "$FILE"
+
+    echo "[OK] added $port"
+}
+
+remove_port() {
+    read -p "tcp or udp? (t/u): " proto
+    read -p "port: " port
+
+    FILE="/etc/nft_ports_tcp.list"
+    [ "$proto" = "u" ] && FILE="/etc/nft_ports_udp.list"
+
+    grep -v "^$port$" "$FILE" > tmp && mv tmp "$FILE"
+    echo "[OK] removed $port"
 }
 
 menu() {
     while true; do
         echo ""
-        echo "=============================="
-        echo " NFT FIREWALL MANAGER"
-        echo "=============================="
+        echo "===== NFT FIREWALL v2 ====="
         echo "1) Show ports"
         echo "2) Add port"
         echo "3) Remove port"
-        echo "4) Apply & restart nftables"
+        echo "4) Apply changes"
         echo "5) Exit"
-        echo "=============================="
-        read -p "Select: " opt
+        echo "==========================="
+        read -p "Select: " c
 
-        case $opt in
+        case $c in
             1) show_ports ;;
             2) add_port ;;
             3) remove_port ;;
             4) apply ;;
             5) exit 0 ;;
-            *) echo "Invalid" ;;
+            *) echo "invalid" ;;
         esac
     done
 }
 
-# ======================
+# =========================
 # INIT
-# ======================
+# =========================
 ensure_nft
-backup_conf
 
-# init default ports if not exist
-if [ ! -f /etc/nft_ports_tcp.list ]; then
-    echo "22 80 443" | tr ' ' '\n' > /etc/nft_ports_tcp.list
-fi
+touch /etc/nft_ports_tcp.list
+touch /etc/nft_ports_udp.list
 
-if [ ! -f /etc/nft_ports_udp.list ]; then
-    touch /etc/nft_ports_udp.list
-fi
+# ensure defaults exist
+for p in 22 80 443; do
+    grep -qx "$p" /etc/nft_ports_tcp.list || echo "$p" >> /etc/nft_ports_tcp.list
+done
 
-# first run auto apply
-build_ruleset
-systemctl enable nftables >/dev/null 2>&1 || true
-systemctl restart nftables
-
+apply
 menu
-
