@@ -4,7 +4,7 @@ set -e
 
 # Report/output timezone. Asia/Shanghai and Asia/Singapore are both UTC+8.
 REPORT_TZ="${REPORT_TZ:-Asia/Shanghai}"
-REPORT_TZ_LABEL="${REPORT_TZ_LABEL:-UTC+8}"
+REPORT_TZ_LABEL="${REPORT_TZ_LABEL:-}"
 
 LOG_PREFIX="${LOG_PREFIX:-nft-new:}"
 TOP_N="${TOP_N:-10}"
@@ -23,6 +23,20 @@ pause() {
     read -r -p "Press Enter to continue..."
 }
 
+derive_report_tz_label() {
+    offset="$(TZ="$REPORT_TZ" date '+%z')"
+    sign="${offset:0:1}"
+    hh="${offset:1:2}"
+    mm="${offset:3:2}"
+    hh_num="$((10#$hh))"
+
+    if [ "$mm" = "00" ]; then
+        REPORT_TZ_LABEL="UTC${sign}${hh_num}"
+    else
+        REPORT_TZ_LABEL="UTC${sign}${hh_num}:${mm}"
+    fi
+}
+
 usage() {
     cat <<'EOF_USAGE'
 Usage:
@@ -37,13 +51,14 @@ Optional environment variables:
   TOP_N=20 bash /root/nft_conn_report_top10_utc8_folded_v2.sh daily
   PORT_LIMIT=20 bash /root/nft_conn_report_top10_utc8_folded_v2.sh daily
   REPORT_TZ=Asia/Singapore bash /root/nft_conn_report_top10_utc8_folded_v2.sh daily
+  REPORT_TZ=Asia/Tokyo REPORT_TZ_LABEL=UTC+9 bash /root/nft_conn_report_top10_utc8_folded_v2.sh daily
 
 Defaults:
   TOP_N=10
   PORT_LIMIT=0        Show all repeated ports under each top IP.
                       Ports with HITS=1 are always folded and not listed.
   REPORT_TZ=Asia/Shanghai
-  REPORT_TZ_LABEL=UTC+8
+  REPORT_TZ_LABEL is auto-derived from REPORT_TZ unless explicitly set
 
 Timezone note:
   This script converts the requested report range to Unix epoch seconds in REPORT_TZ.
@@ -72,6 +87,10 @@ need_tools_check() {
     if ! TZ="$REPORT_TZ" date '+%Y-%m-%d %H:%M:%S %z' >/dev/null 2>&1; then
         echo "[ERROR] invalid REPORT_TZ: $REPORT_TZ"
         exit 1
+    fi
+
+    if [ -z "$REPORT_TZ_LABEL" ]; then
+        derive_report_tz_label
     fi
 
     if ! printf '%s' "$TOP_N" | grep -Eq '^[0-9]+$' || [ "$TOP_N" -lt 1 ]; then
@@ -345,7 +364,13 @@ report_top_ip_details() {
     start_epoch="$2"
     end_epoch="$3"
 
-    len_seen="$(awk -F',' 'NF>=5 && $5 ~ /^[0-9]+$/ {seen=1} END {print seen+0}' "$csv_file")"
+    row_count="$(awk -F',' 'NF>=4 {c++} END {print c+0}' "$csv_file")"
+    len_rows="$(awk -F',' 'NF>=5 && $5 ~ /^[0-9]+$/ {c++} END {print c+0}' "$csv_file")"
+    if [ "$len_rows" -gt 0 ]; then
+        len_seen=1
+    else
+        len_seen=0
+    fi
 
     line
     echo "TOP ${TOP_N} IP DETAILS: PORTS + ACTIVE TIME RANGE ${REPORT_TZ_LABEL}"
@@ -356,12 +381,16 @@ report_top_ip_details() {
     if [ "$len_seen" -eq 1 ]; then
         total_bytes="$(awk -F',' 'NF>=5 && $5 ~ /^[0-9]+$/ {sum+=$5} END {print sum+0}' "$csv_file")"
         echo "Traffic   : logged packet length total = $(human_bytes "$total_bytes") ($total_bytes bytes)"
+        if [ "$len_rows" -lt "$row_count" ]; then
+            missing_len_rows="$((row_count - len_rows))"
+            echo "Traffic warning: $missing_len_rows matched rows have no LEN= field; traffic is partial"
+        fi
     else
         echo "Traffic   : unknown, no LEN= field found in matched logs"
     fi
 
     top_ips="$(awk -F',' 'NF>=4 {count[$3]++} END {for (ip in count) print count[ip], ip}' "$csv_file" \
-        | sort -k1,1nr \
+        | sort -k1,1nr -k2,2 \
         | head -n "$TOP_N" \
         | awk '{print $2}')"
 
@@ -381,7 +410,13 @@ report_top_ip_details() {
 
         if [ "$len_seen" -eq 1 ]; then
             ip_bytes="$(awk -F',' -v ip="$ip" 'NF>=5 && $3==ip && $5 ~ /^[0-9]+$/ {sum+=$5} END {print sum+0}' "$csv_file")"
-            echo "Logged traffic: $(human_bytes "$ip_bytes") ($ip_bytes bytes)"
+            ip_len_rows="$(awk -F',' -v ip="$ip" 'NF>=5 && $3==ip && $5 ~ /^[0-9]+$/ {c++} END {print c+0}' "$csv_file")"
+            if [ "$ip_len_rows" -lt "$hits" ]; then
+                ip_missing_len_rows="$((hits - ip_len_rows))"
+                echo "Logged traffic: $(human_bytes "$ip_bytes") ($ip_bytes bytes, partial; $ip_missing_len_rows hits without LEN=)"
+            else
+                echo "Logged traffic: $(human_bytes "$ip_bytes") ($ip_bytes bytes)"
+            fi
         else
             echo "Logged traffic: unknown"
         fi
@@ -423,21 +458,24 @@ run_report() {
     start_epoch="$(to_epoch "$start_local")"
     end_epoch="$(to_epoch "$end_local")"
 
-    clear || true
+    if [ -t 1 ]; then
+        clear || true
+    fi
 
     tmp_raw="$(mktemp)"
     tmp_csv="$(mktemp)"
-    trap 'rm -f "$tmp_raw" "$tmp_csv"' EXIT
 
     get_journal_logs "$start_epoch" "$end_epoch" "$tmp_raw"
     extract_logs_csv < "$tmp_raw" > "$tmp_csv"
 
     if [ ! -s "$tmp_csv" ]; then
         show_no_data_help "$title" "$start_epoch" "$end_epoch"
+        rm -f "$tmp_raw" "$tmp_csv"
         return
     fi
 
     report_top_ip_details "$tmp_csv" "$start_epoch" "$end_epoch"
+    rm -f "$tmp_raw" "$tmp_csv"
 }
 
 daily_report() {
@@ -520,7 +558,7 @@ check_status() {
 menu() {
     while true; do
         echo ""
-        echo "===== NFT CONNECTION REPORT TOP10 UTC+8 V2 ====="
+        echo "===== NFT CONNECTION REPORT TOP${TOP_N} ${REPORT_TZ_LABEL} V2 ====="
         echo "1) Daily report"
         echo "2) Weekly report"
         echo "3) Custom date range"
