@@ -364,6 +364,27 @@ stop_disable_nftables() {
     esac
 }
 
+
+show_nftables_active_status() {
+    if has_cmd systemctl; then
+        active_status="$(systemctl is-active nftables 2>/dev/null || true)"
+
+        case "$active_status" in
+            active)
+                echo "nftables active: yes"
+                ;;
+            inactive|failed|activating|deactivating)
+                echo "nftables active: no ($active_status)"
+                ;;
+            *)
+                echo "nftables active: unknown"
+                ;;
+        esac
+    else
+        echo "nftables active: unknown (systemctl not found)"
+    fi
+}
+
 show_ports() {
     echo "=== TCP saved list ==="
     cat "$TCP_FILE" 2>/dev/null || true
@@ -589,7 +610,7 @@ show_log_status() {
 show_help() {
     cat <<EOF_HELP
 Usage:
-  bash /root/nft_firewall_manager_with_service_v2.sh
+  bash /root/nft_firewall_manager_with_service_v3.sh
 
 What this version does:
   1. Logs allowed TCP new connections before accept.
@@ -606,8 +627,8 @@ Important:
   JOURNAL_LIMIT default is: 100M
 
 Examples:
-  JOURNAL_LIMIT=100M bash /root/nft_firewall_manager_with_service_v2.sh
-  LOG_PREFIX_NFT='nft-new: ' bash /root/nft_firewall_manager_with_service_v2.sh
+  JOURNAL_LIMIT=100M bash /root/nft_firewall_manager_with_service_v3.sh
+  LOG_PREFIX_NFT='nft-new: ' bash /root/nft_firewall_manager_with_service_v3.sh
 EOF_HELP
 }
 
@@ -615,6 +636,7 @@ menu() {
     while true; do
         echo ""
         echo "===== NFT FIREWALL MANAGER WITH SERVICE ====="
+        show_nftables_active_status
         echo "1) Show ports and log rules"
         echo "2) Add port(s)"
         echo "3) Remove port(s)"
