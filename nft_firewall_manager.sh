@@ -1,5 +1,5 @@
-cat > /root/nft_firewall_manager.sh <<'EOF'
 #!/usr/bin/env bash
+
 set -e
 
 CONF="/etc/nftables.conf"
@@ -11,6 +11,7 @@ mkdir -p "$BACKUP_DIR"
 
 ensure_nft() {
     if ! command -v nft >/dev/null 2>&1; then
+        echo "[+] Installing nftables..."
         apt update -y
         apt install -y nftables
     fi
@@ -18,6 +19,7 @@ ensure_nft() {
 
 init_files() {
     touch "$TCP_FILE" "$UDP_FILE"
+
     if [ ! -s "$TCP_FILE" ]; then
         printf "22\n80\n443\n" > "$TCP_FILE"
     fi
@@ -45,17 +47,26 @@ valid_item() {
         *-*)
             start="${item%-*}"
             end="${item#*-}"
+
             case "$start$end" in
-                *[!0-9]*|"") return 1 ;;
+                *[!0-9]*|"")
+                    return 1
+                    ;;
             esac
-            [ "$start" -ge 1 ] && [ "$start" -le 65535 ] && \
-            [ "$end" -ge 1 ] && [ "$end" -le 65535 ] && \
+
+            [ "$start" -ge 1 ] && \
+            [ "$start" -le 65535 ] && \
+            [ "$end" -ge 1 ] && \
+            [ "$end" -le 65535 ] && \
             [ "$start" -le "$end" ]
             ;;
         *)
             case "$item" in
-                *[!0-9]*|"") return 1 ;;
+                *[!0-9]*|"")
+                    return 1
+                    ;;
             esac
+
             [ "$item" -ge 1 ] && [ "$item" -le 65535 ]
             ;;
     esac
@@ -63,10 +74,11 @@ valid_item() {
 
 csv_from_file() {
     file="$1"
-    [ -s "$file" ] || {
+
+    if [ ! -s "$file" ]; then
         echo ""
         return
-    }
+    fi
 
     raw="$(cat "$file")"
     norm="$(normalize_text "$raw")"
@@ -74,6 +86,7 @@ csv_from_file() {
 
     OLDIFS="$IFS"
     IFS=','
+
     for item in $norm; do
         IFS="$OLDIFS"
 
@@ -84,7 +97,8 @@ csv_from_file() {
 
         if valid_item "$item"; then
             case ",$result," in
-                *,"$item",*) ;;
+                *,"$item",*)
+                    ;;
                 *)
                     if [ -z "$result" ]; then
                         result="$item"
@@ -99,6 +113,7 @@ csv_from_file() {
 
         IFS=','
     done
+
     IFS="$OLDIFS"
 
     echo "$result"
@@ -107,6 +122,7 @@ csv_from_file() {
 csv_from_text() {
     text="$1"
     tmp="$(mktemp)"
+
     printf "%s\n" "$text" > "$tmp"
     csv_from_file "$tmp"
     rm -f "$tmp"
@@ -117,30 +133,36 @@ write_csv_file() {
     csv="$2"
 
     : > "$file"
+
     csv="$(normalize_text "$csv")"
 
     [ -n "$csv" ] || return
 
     OLDIFS="$IFS"
     IFS=','
+
     for item in $csv; do
         IFS="$OLDIFS"
+
         if valid_item "$item"; then
             echo "$item" >> "$file"
         else
             echo "[WARN] ignored invalid port item: $item" >&2
         fi
+
         IFS=','
     done
+
     IFS="$OLDIFS"
 }
 
 build_tmp_ruleset() {
     tmp="$1"
+
     tcp_ports="$(csv_from_file "$TCP_FILE")"
     udp_ports="$(csv_from_file "$UDP_FILE")"
 
-    cat > "$tmp" <<EOF2
+    cat > "$tmp" <<EOF_NFT
 #!/usr/sbin/nft -f
 
 flush ruleset
@@ -154,7 +176,7 @@ table inet filter {
         ct state established,related accept
         ct state invalid drop
 
-EOF2
+EOF_NFT
 
     if [ -n "$tcp_ports" ]; then
         echo "        tcp dport {$tcp_ports} accept" >> "$tmp"
@@ -164,7 +186,7 @@ EOF2
         echo "        udp dport {$udp_ports} accept" >> "$tmp"
     fi
 
-    cat >> "$tmp" <<'EOF2'
+    cat >> "$tmp" <<'EOF_NFT'
 
         ip protocol icmp accept
         ip6 nexthdr icmpv6 accept
@@ -184,20 +206,23 @@ EOF2
         accept
     }
 }
-EOF2
+EOF_NFT
 }
 
 apply_changes() {
     tmp="$(mktemp)"
+
     build_tmp_ruleset "$tmp"
 
     echo "[+] Checking nftables config..."
+
     if nft -c -f "$tmp"; then
         backup_conf
         cp "$tmp" "$CONF"
         systemctl enable nftables >/dev/null 2>&1 || true
         systemctl restart nftables
         rm -f "$tmp"
+
         echo "[OK] nftables applied safely"
     else
         rm -f "$tmp"
@@ -210,37 +235,54 @@ show_ports() {
     echo "=== TCP saved list ==="
     cat "$TCP_FILE" 2>/dev/null || true
     echo ""
+
     echo "=== TCP effective nft format ==="
     csv_from_file "$TCP_FILE"
     echo ""
+
     echo "=== UDP saved list ==="
     cat "$UDP_FILE" 2>/dev/null || true
     echo ""
+
     echo "=== UDP effective nft format ==="
     csv_from_file "$UDP_FILE"
     echo ""
+
     echo "=== Current active nft dport rules ==="
     nft list ruleset 2>/dev/null | grep -E 'dport' || echo "No active dport rules found"
 }
 
 add_ports() {
     read -p "tcp or udp? (t/u): " proto
+
     case "$proto" in
-        t|T) file="$TCP_FILE" ;;
-        u|U) file="$UDP_FILE" ;;
-        *) echo "[ERROR] invalid protocol"; return ;;
+        t|T)
+            file="$TCP_FILE"
+            ;;
+        u|U)
+            file="$UDP_FILE"
+            ;;
+        *)
+            echo "[ERROR] invalid protocol"
+            return
+            ;;
     esac
 
-    echo "Examples: 3556 or 3666-3669 or 3556,3666-3669,15000-18369"
+    echo "Examples:"
+    echo "  3556"
+    echo "  3666-3669"
+    echo "  3556,3666-3669,15000-18369"
     read -p "port(s): " input
 
     add_csv="$(csv_from_text "$input")"
-    [ -n "$add_csv" ] || {
+
+    if [ -z "$add_csv" ]; then
         echo "[ERROR] no valid ports found"
         return
-    }
+    fi
 
     current_csv="$(csv_from_file "$file")"
+
     if [ -n "$current_csv" ]; then
         new_csv="$(csv_from_text "$current_csv,$add_csv")"
     else
@@ -248,50 +290,77 @@ add_ports() {
     fi
 
     write_csv_file "$file" "$new_csv"
-    echo "[OK] saved ports: $new_csv"
+
+    echo "[OK] saved ports:"
+    cat "$file"
 
     read -p "Apply now? (y/n): " yn
+
     case "$yn" in
-        y|Y) apply_changes ;;
-        *) echo "[INFO] saved but not applied yet" ;;
+        y|Y)
+            apply_changes
+            ;;
+        *)
+            echo "[INFO] saved but not applied yet"
+            ;;
     esac
 }
 
 remove_ports() {
     read -p "tcp or udp? (t/u): " proto
+
     case "$proto" in
-        t|T) file="$TCP_FILE" ;;
-        u|U) file="$UDP_FILE" ;;
-        *) echo "[ERROR] invalid protocol"; return ;;
+        t|T)
+            file="$TCP_FILE"
+            ;;
+        u|U)
+            file="$UDP_FILE"
+            ;;
+        *)
+            echo "[ERROR] invalid protocol"
+            return
+            ;;
     esac
 
-    echo "Examples: 3556 or 3666-3669 or 3556,3666-3669,15000-18369"
+    echo "Examples:"
+    echo "  3556"
+    echo "  3666-3669"
+    echo "  3556,3666-3669,15000-18369"
     read -p "port(s) to remove: " input
 
     remove_csv="$(csv_from_text "$input")"
     current_csv="$(csv_from_file "$file")"
 
-    [ -n "$remove_csv" ] || {
+    if [ -z "$remove_csv" ]; then
         echo "[ERROR] no valid remove items"
         return
-    }
+    fi
+
+    if [ -z "$current_csv" ]; then
+        echo "[INFO] no saved ports"
+        return
+    fi
 
     if [ "$file" = "$TCP_FILE" ]; then
         case ",$remove_csv," in
             *,22,*)
-                echo "[WARN] You are removing TCP 22. Make sure another SSH port is open and tested."
+                echo "[WARN] You are removing TCP 22."
+                echo "[WARN] Make sure another SSH port is already open and tested."
                 read -p "Type YES to continue: " confirm
-                [ "$confirm" = "YES" ] || {
+
+                if [ "$confirm" != "YES" ]; then
                     echo "[INFO] cancelled"
                     return
-                }
+                fi
                 ;;
         esac
     fi
 
     new_csv=""
+
     OLDIFS="$IFS"
     IFS=','
+
     for item in $current_csv; do
         IFS="$OLDIFS"
         skip=0
@@ -299,7 +368,11 @@ remove_ports() {
         IFS=','
         for r in $remove_csv; do
             IFS="$OLDIFS"
-            [ "$item" = "$r" ] && skip=1
+
+            if [ "$item" = "$r" ]; then
+                skip=1
+            fi
+
             IFS=','
         done
         IFS="$OLDIFS"
@@ -314,27 +387,40 @@ remove_ports() {
 
         IFS=','
     done
+
     IFS="$OLDIFS"
 
     write_csv_file "$file" "$new_csv"
-    echo "[OK] saved ports: $new_csv"
+
+    echo "[OK] saved ports:"
+    cat "$file" 2>/dev/null || true
 
     read -p "Apply now? (y/n): " yn
+
     case "$yn" in
-        y|Y) apply_changes ;;
-        *) echo "[INFO] saved but not applied yet" ;;
+        y|Y)
+            apply_changes
+            ;;
+        *)
+            echo "[INFO] saved but not applied yet"
+            ;;
     esac
 }
 
 reset_saved_ports() {
-    echo "[WARN] Reset saved lists to TCP 22,80,443 and empty UDP."
+    echo "[WARN] This resets saved port lists to:"
+    echo "TCP: 22,80,443"
+    echo "UDP: empty"
     read -p "Type YES to reset: " confirm
-    [ "$confirm" = "YES" ] || {
+
+    if [ "$confirm" != "YES" ]; then
         echo "[INFO] cancelled"
         return
-    }
+    fi
+
     printf "22\n80\n443\n" > "$TCP_FILE"
     : > "$UDP_FILE"
+
     echo "[OK] saved port lists reset"
 }
 
@@ -353,14 +439,30 @@ menu() {
         read -p "Select: " c
 
         case "$c" in
-            1) show_ports ;;
-            2) add_ports ;;
-            3) remove_ports ;;
-            4) apply_changes ;;
-            5) nft list ruleset ;;
-            6) reset_saved_ports ;;
-            7) exit 0 ;;
-            *) echo "invalid" ;;
+            1)
+                show_ports
+                ;;
+            2)
+                add_ports
+                ;;
+            3)
+                remove_ports
+                ;;
+            4)
+                apply_changes
+                ;;
+            5)
+                nft list ruleset
+                ;;
+            6)
+                reset_saved_ports
+                ;;
+            7)
+                exit 0
+                ;;
+            *)
+                echo "invalid"
+                ;;
         esac
     done
 }
@@ -368,4 +470,6 @@ menu() {
 ensure_nft
 init_files
 menu
-EOF
+
+
+
