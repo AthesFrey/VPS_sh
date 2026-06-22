@@ -369,7 +369,3 @@ ensure_nft
 init_files
 menu
 EOF
-
-chmod +x /root/nft_firewall_manager.sh
-
-
