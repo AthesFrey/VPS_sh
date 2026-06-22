@@ -13,7 +13,6 @@ JOURNAL_DROPIN_DIR="${JOURNAL_DROPIN_DIR:-/etc/systemd/journald.conf.d}"
 JOURNAL_DROPIN_FILE="${JOURNAL_DROPIN_FILE:-$JOURNAL_DROPIN_DIR/99-nft-log-size-limit.conf}"
 LOGROTATE_FILE="${LOGROTATE_FILE:-/etc/logrotate.d/nft-kernel-logs}"
 
-mkdir -p "$BACKUP_DIR"
 
 has_cmd() {
     command -v "$1" >/dev/null 2>&1
@@ -27,10 +26,31 @@ need_root() {
 }
 
 ensure_nft() {
-    if ! has_cmd nft; then
-        echo "[+] Installing nftables..."
-        apt update -y
-        apt install -y nftables
+    if has_cmd nft; then
+        return 0
+    fi
+
+    echo "[+] nft command not found. Installing nftables..."
+
+    if has_cmd apt-get; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -y
+        apt-get install -y nftables
+    else
+        echo "[ERROR] nftables is not installed and apt-get was not found."
+        echo "[ERROR] Please install nftables manually for this OS, then run this script again."
+        return 1
+    fi
+}
+
+ensure_dirs() {
+    mkdir -p "$BACKUP_DIR"
+}
+
+ensure_systemctl() {
+    if ! has_cmd systemctl; then
+        echo "[ERROR] systemctl not found. This function requires systemd."
+        return 1
     fi
 }
 
@@ -277,10 +297,15 @@ apply_changes() {
     echo "[+] Checking nftables config..."
 
     if nft -c -f "$tmp"; then
+        if ! ensure_systemctl; then
+            rm -f "$tmp"
+            return 1
+        fi
+
         backup_conf
         cp "$tmp" "$CONF"
         configure_journal_limit
-        systemctl enable nftables >/dev/null 2>&1 || true
+        systemctl enable nftables
         systemctl restart nftables
         rm -f "$tmp"
 
@@ -293,6 +318,50 @@ apply_changes() {
         echo "[ERROR] Config check failed. Nothing changed."
         return 1
     fi
+}
+
+start_enable_nftables() {
+    ensure_systemctl || return 1
+
+    echo "[+] Enabling nftables at boot and starting it now..."
+    systemctl enable --now nftables
+
+    echo "[OK] nftables is enabled and started."
+    echo ""
+    systemctl status nftables --no-pager -l || true
+}
+
+stop_disable_nftables() {
+    ensure_systemctl || return 1
+
+    echo "[WARN] This will stop nftables now and disable nftables at boot."
+    echo "[WARN] Your AWS Security Group / cloud firewall should still allow SSH before continuing."
+    read -r -p "Type YES to continue: " confirm
+
+    if [ "$confirm" != "YES" ]; then
+        echo "[INFO] cancelled"
+        return
+    fi
+
+    echo "[+] Stopping nftables and disabling it at boot..."
+    systemctl disable --now nftables
+
+    echo "[OK] nftables is stopped and disabled at boot."
+    echo ""
+    systemctl status nftables --no-pager -l || true
+
+    echo ""
+    read -r -p "Flush active nft ruleset too? This clears current nft rules now. (y/n): " flush_yn
+    case "$flush_yn" in
+        y|Y)
+            echo "[+] Flushing active nft ruleset..."
+            nft flush ruleset
+            echo "[OK] Active nft ruleset flushed."
+            ;;
+        *)
+            echo "[INFO] Active nft ruleset was not flushed."
+            ;;
+    esac
 }
 
 show_ports() {
@@ -520,30 +589,32 @@ show_log_status() {
 show_help() {
     cat <<EOF_HELP
 Usage:
-  bash /root/nft_firewall_manager_final.sh
+  bash /root/nft_firewall_manager_with_service_v2.sh
 
-What this final version does:
+What this version does:
   1. Logs allowed TCP new connections before accept.
   2. Logs allowed UDP new connections before accept.
   3. Logs other new connections before drop.
   4. Keeps established/related traffic accepted without logging every packet.
   5. Configures journald total log storage target to $JOURNAL_LIMIT.
   6. Adds a logrotate fallback for common text logs: kern.log, syslog, messages.
+  7. Can enable and start nftables immediately, and enable nftables at boot.
+  8. Can stop nftables immediately, and disable nftables at boot.
 
 Important:
   LOG_PREFIX_NFT default is: "nft-new: "
   JOURNAL_LIMIT default is: 100M
 
 Examples:
-  JOURNAL_LIMIT=100M bash /root/nft_firewall_manager_final.sh
-  LOG_PREFIX_NFT='nft-new: ' bash /root/nft_firewall_manager_final.sh
+  JOURNAL_LIMIT=100M bash /root/nft_firewall_manager_with_service_v2.sh
+  LOG_PREFIX_NFT='nft-new: ' bash /root/nft_firewall_manager_with_service_v2.sh
 EOF_HELP
 }
 
 menu() {
     while true; do
         echo ""
-        echo "===== NFT FIREWALL MANAGER FINAL ====="
+        echo "===== NFT FIREWALL MANAGER WITH SERVICE ====="
         echo "1) Show ports and log rules"
         echo "2) Add port(s)"
         echo "3) Remove port(s)"
@@ -552,8 +623,10 @@ menu() {
         echo "6) Reset saved port lists"
         echo "7) Configure log size limit only"
         echo "8) Show log size status"
-        echo "9) Help"
-        echo "10) Exit"
+        echo "9) Enable/start nftables and enable at boot"
+        echo "10) Stop/disable nftables and disable at boot"
+        echo "11) Help"
+        echo "12) Exit"
         echo "======================================"
         read -r -p "Select: " c
 
@@ -571,7 +644,7 @@ menu() {
                 apply_changes
                 ;;
             5)
-                nft list ruleset
+                nft list ruleset 2>/dev/null || echo "[INFO] No active nft ruleset found, or nft command failed."
                 ;;
             6)
                 reset_saved_ports
@@ -583,9 +656,15 @@ menu() {
                 show_log_status
                 ;;
             9)
-                show_help
+                start_enable_nftables
                 ;;
             10)
+                stop_disable_nftables
+                ;;
+            11)
+                show_help
+                ;;
+            12)
                 exit 0
                 ;;
             *)
@@ -597,5 +676,6 @@ menu() {
 
 need_root
 ensure_nft
+ensure_dirs
 init_files
 menu
