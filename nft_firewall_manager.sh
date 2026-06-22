@@ -2,15 +2,32 @@
 
 set -e
 
-CONF="/etc/nftables.conf"
-BACKUP_DIR="/etc/nftables.backup"
-TCP_FILE="/etc/nft_ports_tcp.list"
-UDP_FILE="/etc/nft_ports_udp.list"
+CONF="${CONF:-/etc/nftables.conf}"
+BACKUP_DIR="${BACKUP_DIR:-/etc/nftables.backup}"
+TCP_FILE="${TCP_FILE:-/etc/nft_ports_tcp.list}"
+UDP_FILE="${UDP_FILE:-/etc/nft_ports_udp.list}"
+
+LOG_PREFIX_NFT="${LOG_PREFIX_NFT:-nft-new: }"
+JOURNAL_LIMIT="${JOURNAL_LIMIT:-100M}"
+JOURNAL_DROPIN_DIR="${JOURNAL_DROPIN_DIR:-/etc/systemd/journald.conf.d}"
+JOURNAL_DROPIN_FILE="${JOURNAL_DROPIN_FILE:-$JOURNAL_DROPIN_DIR/99-nft-log-size-limit.conf}"
+LOGROTATE_FILE="${LOGROTATE_FILE:-/etc/logrotate.d/nft-kernel-logs}"
 
 mkdir -p "$BACKUP_DIR"
 
+has_cmd() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+need_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "[ERROR] Please run as root."
+        exit 1
+    fi
+}
+
 ensure_nft() {
-    if ! command -v nft >/dev/null 2>&1; then
+    if ! has_cmd nft; then
         echo "[+] Installing nftables..."
         apt update -y
         apt install -y nftables
@@ -33,11 +50,9 @@ backup_conf() {
 
 normalize_text() {
     printf "%s" "$1" \
-        | tr '，' ',' \
+        | tr '[:space:]' ',' \
         | tr ':' '-' \
-        | tr '\n' ',' \
-        | tr -d '[:space:]' \
-        | sed 's/,,*/,/g; s/^,//; s/,$//'
+        | sed 's/，/,/g; s/,,*/,/g; s/^,//; s/,$//'
 }
 
 valid_item() {
@@ -156,6 +171,50 @@ write_csv_file() {
     IFS="$OLDIFS"
 }
 
+configure_journal_limit() {
+    echo "[+] Configuring journald size limit: $JOURNAL_LIMIT"
+
+    mkdir -p "$JOURNAL_DROPIN_DIR"
+
+    cat > "$JOURNAL_DROPIN_FILE" <<EOF_JOURNAL
+[Journal]
+SystemMaxUse=$JOURNAL_LIMIT
+RuntimeMaxUse=$JOURNAL_LIMIT
+SystemMaxFileSize=$JOURNAL_LIMIT
+RuntimeMaxFileSize=$JOURNAL_LIMIT
+EOF_JOURNAL
+
+    if has_cmd systemctl; then
+        systemctl restart systemd-journald 2>/dev/null || true
+    fi
+
+    if has_cmd journalctl; then
+        journalctl --vacuum-size="$JOURNAL_LIMIT" >/dev/null 2>&1 || true
+    fi
+
+    configure_logrotate_limit
+
+    echo "[OK] Log storage limit configured."
+}
+
+configure_logrotate_limit() {
+    if [ ! -d /etc/logrotate.d ]; then
+        return
+    fi
+
+    cat > "$LOGROTATE_FILE" <<EOF_LOGROTATE
+/var/log/kern.log /var/log/syslog /var/log/messages {
+    size $JOURNAL_LIMIT
+    rotate 1
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+EOF_LOGROTATE
+}
+
 build_tmp_ruleset() {
     tmp="$1"
 
@@ -170,7 +229,7 @@ flush ruleset
 table inet filter {
 
     chain input {
-        type filter hook input priority 0;
+        type filter hook input priority 0; policy drop;
 
         iif "lo" accept
         ct state established,related accept
@@ -179,30 +238,31 @@ table inet filter {
 EOF_NFT
 
     if [ -n "$tcp_ports" ]; then
+        echo "        ct state new tcp dport {$tcp_ports} log prefix \"$LOG_PREFIX_NFT\" level info" >> "$tmp"
         echo "        tcp dport {$tcp_ports} accept" >> "$tmp"
     fi
 
     if [ -n "$udp_ports" ]; then
+        echo "        ct state new udp dport {$udp_ports} log prefix \"$LOG_PREFIX_NFT\" level info" >> "$tmp"
         echo "        udp dport {$udp_ports} accept" >> "$tmp"
     fi
 
-    cat >> "$tmp" <<'EOF_NFT'
+    cat >> "$tmp" <<EOF_NFT
 
         ip protocol icmp accept
         ip6 nexthdr icmpv6 accept
 
-        ct state new log prefix "nft-new: " level info
-
+        ct state new log prefix "$LOG_PREFIX_NFT" level info
         counter drop
     }
 
     chain forward {
-        type filter hook forward priority 0;
+        type filter hook forward priority 0; policy accept;
         accept
     }
 
     chain output {
-        type filter hook output priority 0;
+        type filter hook output priority 0; policy accept;
         accept
     }
 }
@@ -219,11 +279,15 @@ apply_changes() {
     if nft -c -f "$tmp"; then
         backup_conf
         cp "$tmp" "$CONF"
+        configure_journal_limit
         systemctl enable nftables >/dev/null 2>&1 || true
         systemctl restart nftables
         rm -f "$tmp"
 
         echo "[OK] nftables applied safely"
+        echo "[OK] Allowed TCP/UDP ports are logged before accept."
+        echo "[OK] Other new connections are logged before drop."
+        echo "[OK] Journal/log size limit target: $JOURNAL_LIMIT"
     else
         rm -f "$tmp"
         echo "[ERROR] Config check failed. Nothing changed."
@@ -248,12 +312,20 @@ show_ports() {
     csv_from_file "$UDP_FILE"
     echo ""
 
-    echo "=== Current active nft dport rules ==="
-    nft list ruleset 2>/dev/null | grep -E 'dport' || echo "No active dport rules found"
+    echo "=== Current active nft dport/log rules ==="
+    nft list ruleset 2>/dev/null | grep -E 'ct state new|dport|log prefix|counter drop' || echo "No active matching rules found"
+    echo ""
+
+    echo "=== Journal limit config ==="
+    if [ -f "$JOURNAL_DROPIN_FILE" ]; then
+        cat "$JOURNAL_DROPIN_FILE"
+    else
+        echo "No journal limit drop-in found: $JOURNAL_DROPIN_FILE"
+    fi
 }
 
 add_ports() {
-    read -p "tcp or udp? (t/u): " proto
+    read -r -p "tcp or udp? (t/u): " proto
 
     case "$proto" in
         t|T)
@@ -272,7 +344,7 @@ add_ports() {
     echo "  3556"
     echo "  3666-3669"
     echo "  3556,3666-3669,15000-18369"
-    read -p "port(s): " input
+    read -r -p "port(s): " input
 
     add_csv="$(csv_from_text "$input")"
 
@@ -294,7 +366,7 @@ add_ports() {
     echo "[OK] saved ports:"
     cat "$file"
 
-    read -p "Apply now? (y/n): " yn
+    read -r -p "Apply now? (y/n): " yn
 
     case "$yn" in
         y|Y)
@@ -307,7 +379,7 @@ add_ports() {
 }
 
 remove_ports() {
-    read -p "tcp or udp? (t/u): " proto
+    read -r -p "tcp or udp? (t/u): " proto
 
     case "$proto" in
         t|T)
@@ -326,7 +398,7 @@ remove_ports() {
     echo "  3556"
     echo "  3666-3669"
     echo "  3556,3666-3669,15000-18369"
-    read -p "port(s) to remove: " input
+    read -r -p "port(s) to remove: " input
 
     remove_csv="$(csv_from_text "$input")"
     current_csv="$(csv_from_file "$file")"
@@ -346,7 +418,7 @@ remove_ports() {
             *,22,*)
                 echo "[WARN] You are removing TCP 22."
                 echo "[WARN] Make sure another SSH port is already open and tested."
-                read -p "Type YES to continue: " confirm
+                read -r -p "Type YES to continue: " confirm
 
                 if [ "$confirm" != "YES" ]; then
                     echo "[INFO] cancelled"
@@ -395,7 +467,7 @@ remove_ports() {
     echo "[OK] saved ports:"
     cat "$file" 2>/dev/null || true
 
-    read -p "Apply now? (y/n): " yn
+    read -r -p "Apply now? (y/n): " yn
 
     case "$yn" in
         y|Y)
@@ -411,7 +483,7 @@ reset_saved_ports() {
     echo "[WARN] This resets saved port lists to:"
     echo "TCP: 22,80,443"
     echo "UDP: empty"
-    read -p "Type YES to reset: " confirm
+    read -r -p "Type YES to reset: " confirm
 
     if [ "$confirm" != "YES" ]; then
         echo "[INFO] cancelled"
@@ -424,19 +496,66 @@ reset_saved_ports() {
     echo "[OK] saved port lists reset"
 }
 
+show_log_status() {
+    echo "=== journald disk usage ==="
+    journalctl --disk-usage 2>/dev/null || true
+    echo ""
+
+    echo "=== journal limit drop-in ==="
+    if [ -f "$JOURNAL_DROPIN_FILE" ]; then
+        cat "$JOURNAL_DROPIN_FILE"
+    else
+        echo "No journal limit drop-in found."
+    fi
+    echo ""
+
+    echo "=== logrotate fallback ==="
+    if [ -f "$LOGROTATE_FILE" ]; then
+        cat "$LOGROTATE_FILE"
+    else
+        echo "No logrotate fallback found."
+    fi
+}
+
+show_help() {
+    cat <<EOF_HELP
+Usage:
+  bash /root/nft_firewall_manager_final.sh
+
+What this final version does:
+  1. Logs allowed TCP new connections before accept.
+  2. Logs allowed UDP new connections before accept.
+  3. Logs other new connections before drop.
+  4. Keeps established/related traffic accepted without logging every packet.
+  5. Configures journald total log storage target to $JOURNAL_LIMIT.
+  6. Adds a logrotate fallback for common text logs: kern.log, syslog, messages.
+
+Important:
+  LOG_PREFIX_NFT default is: "nft-new: "
+  JOURNAL_LIMIT default is: 100M
+
+Examples:
+  JOURNAL_LIMIT=100M bash /root/nft_firewall_manager_final.sh
+  LOG_PREFIX_NFT='nft-new: ' bash /root/nft_firewall_manager_final.sh
+EOF_HELP
+}
+
 menu() {
     while true; do
         echo ""
-        echo "===== NFT FIREWALL FINAL NO-AWK ====="
-        echo "1) Show ports"
+        echo "===== NFT FIREWALL MANAGER FINAL ====="
+        echo "1) Show ports and log rules"
         echo "2) Add port(s)"
         echo "3) Remove port(s)"
         echo "4) Apply changes"
-        echo "5) Show nft ruleset"
+        echo "5) Show full nft ruleset"
         echo "6) Reset saved port lists"
-        echo "7) Exit"
-        echo "=============================="
-        read -p "Select: " c
+        echo "7) Configure log size limit only"
+        echo "8) Show log size status"
+        echo "9) Help"
+        echo "10) Exit"
+        echo "======================================"
+        read -r -p "Select: " c
 
         case "$c" in
             1)
@@ -458,6 +577,15 @@ menu() {
                 reset_saved_ports
                 ;;
             7)
+                configure_journal_limit
+                ;;
+            8)
+                show_log_status
+                ;;
+            9)
+                show_help
+                ;;
+            10)
                 exit 0
                 ;;
             *)
@@ -467,9 +595,7 @@ menu() {
     done
 }
 
+need_root
 ensure_nft
 init_files
 menu
-
-
-
