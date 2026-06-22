@@ -2,8 +2,7 @@
 
 set -e
 
-# Output/report timezone. Default is UTC+8.
-# You may set REPORT_TZ=Asia/Singapore if preferred; both are UTC+8.
+# Report/output timezone. Asia/Shanghai and Asia/Singapore are both UTC+8.
 REPORT_TZ="${REPORT_TZ:-Asia/Shanghai}"
 REPORT_TZ_LABEL="${REPORT_TZ_LABEL:-UTC+8}"
 
@@ -27,16 +26,17 @@ pause() {
 usage() {
     cat <<'EOF_USAGE'
 Usage:
-  bash /root/nft_conn_report_top10_utc8_folded.sh daily
-  bash /root/nft_conn_report_top10_utc8_folded.sh weekly
-  bash /root/nft_conn_report_top10_utc8_folded.sh custom
-  bash /root/nft_conn_report_top10_utc8_folded.sh status
+  bash /root/nft_conn_report_top10_utc8_folded_v2.sh daily
+  bash /root/nft_conn_report_top10_utc8_folded_v2.sh weekly
+  bash /root/nft_conn_report_top10_utc8_folded_v2.sh custom
+  bash /root/nft_conn_report_top10_utc8_folded_v2.sh status
+  bash /root/nft_conn_report_top10_utc8_folded_v2.sh raw
 
 Optional environment variables:
-  LOG_PREFIX='nft-new:' bash /root/nft_conn_report_top10_utc8_folded.sh daily
-  TOP_N=20 bash /root/nft_conn_report_top10_utc8_folded.sh daily
-  PORT_LIMIT=20 bash /root/nft_conn_report_top10_utc8_folded.sh daily
-  REPORT_TZ=Asia/Singapore bash /root/nft_conn_report_top10_utc8_folded.sh daily
+  LOG_PREFIX='nft-new:' bash /root/nft_conn_report_top10_utc8_folded_v2.sh daily
+  TOP_N=20 bash /root/nft_conn_report_top10_utc8_folded_v2.sh daily
+  PORT_LIMIT=20 bash /root/nft_conn_report_top10_utc8_folded_v2.sh daily
+  REPORT_TZ=Asia/Singapore bash /root/nft_conn_report_top10_utc8_folded_v2.sh daily
 
 Defaults:
   TOP_N=10
@@ -46,10 +46,10 @@ Defaults:
   REPORT_TZ_LABEL=UTC+8
 
 Timezone note:
-  This script reads journal entries with journalctl -o short-unix, then converts the
-  stored epoch timestamp to REPORT_TZ for display. This avoids confusion when the
-  server, journal output, or pasted logs were generated under other time zones such
-  as Europe/Rome, Asia/Singapore, or Asia/Tokyo.
+  This script converts the requested report range to Unix epoch seconds in REPORT_TZ.
+  It filters journal entries by epoch, then displays all timestamps in REPORT_TZ.
+  This avoids problems when the server is using UTC, Europe/Rome, Asia/Singapore,
+  Asia/Tokyo, or another timezone.
 
 Traffic note:
   Traffic is calculated from packet length fields in the nft/kernel log, for example LEN=60.
@@ -73,6 +73,21 @@ need_tools_check() {
         echo "[ERROR] invalid REPORT_TZ: $REPORT_TZ"
         exit 1
     fi
+
+    if ! printf '%s' "$TOP_N" | grep -Eq '^[0-9]+$' || [ "$TOP_N" -lt 1 ]; then
+        echo "[ERROR] TOP_N must be a positive integer"
+        exit 1
+    fi
+
+    if ! printf '%s' "$PORT_LIMIT" | grep -Eq '^[0-9]+$'; then
+        echo "[ERROR] PORT_LIMIT must be 0 or a positive integer"
+        exit 1
+    fi
+}
+
+to_epoch() {
+    local_time="$1"
+    TZ="$REPORT_TZ" date -d "$local_time" '+%s'
 }
 
 format_epoch() {
@@ -80,20 +95,67 @@ format_epoch() {
     TZ="$REPORT_TZ" date -d "@$epoch" '+%Y-%m-%dT%H:%M:%S%z'
 }
 
-format_range_time() {
-    local_time="$1"
-    TZ="$REPORT_TZ" date -d "$local_time" '+%Y-%m-%d %H:%M:%S %z'
+format_epoch_range() {
+    epoch="$1"
+    TZ="$REPORT_TZ" date -d "@$epoch" '+%Y-%m-%d %H:%M:%S %z'
+}
+
+filter_epoch_range() {
+    start_epoch="$1"
+    end_epoch="$2"
+
+    awk -v start="$start_epoch" -v end="$end_epoch" '
+    {
+        epoch=$1
+        sub(/\..*/, "", epoch)
+        if (epoch ~ /^[0-9]+$/ && epoch >= start && epoch <= end) {
+            print $0
+        }
+    }'
+}
+
+journal_query_fast() {
+    start_epoch="$1"
+    end_epoch="$2"
+
+    # Convert epoch to the server local timezone for journalctl arguments.
+    # journalctl parses --since/--until in the server local timezone, so this
+    # avoids passing "+0800" or other offset strings that some systems reject.
+    since_arg="$(date -d "@$start_epoch" '+%Y-%m-%d %H:%M:%S')"
+    until_arg="$(date -d "@$end_epoch" '+%Y-%m-%d %H:%M:%S')"
+
+    journalctl -k -o short-unix --since "$since_arg" --until "$until_arg" --no-pager 2>/dev/null \
+        | grep -F "$LOG_PREFIX" \
+        | filter_epoch_range "$start_epoch" "$end_epoch" || true
+}
+
+journal_query_fallback() {
+    start_epoch="$1"
+    end_epoch="$2"
+
+    # Fallback intentionally does not pass timezone strings to journalctl.
+    # It reads kernel journal lines with epoch timestamps, then filters by epoch itself.
+    journalctl -k -o short-unix --no-pager 2>/dev/null \
+        | grep -F "$LOG_PREFIX" \
+        | filter_epoch_range "$start_epoch" "$end_epoch" || true
 }
 
 get_journal_logs() {
-    start_local="$1"
-    end_local="$2"
+    start_epoch="$1"
+    end_epoch="$2"
+    out_file="$3"
 
-    since_arg="$(format_range_time "$start_local")"
-    until_arg="$(format_range_time "$end_local")"
+    tmp_fast="$(mktemp)"
+    journal_query_fast "$start_epoch" "$end_epoch" > "$tmp_fast"
 
-    journalctl -k -o short-unix --since "$since_arg" --until "$until_arg" --no-pager 2>/dev/null \
-        | grep -F "$LOG_PREFIX" || true
+    if [ -s "$tmp_fast" ]; then
+        cat "$tmp_fast" > "$out_file"
+        rm -f "$tmp_fast"
+        return
+    fi
+
+    rm -f "$tmp_fast"
+    journal_query_fallback "$start_epoch" "$end_epoch" > "$out_file"
 }
 
 extract_logs_csv() {
@@ -209,15 +271,19 @@ emit_port_rows() {
                 }
                 BEGIN {
                     shown=0
+                    total=0
                     printf "  %-8s %-14s %s\n", "HITS", "TRAFFIC", "PROTO/PORT"
                 }
-                limit == 0 || shown < limit {
-                    shown++
-                    printf "  %-8s %-14s %s\n", $1, human($2), $3
+                {
+                    total++
+                    if (limit == 0 || shown < limit) {
+                        shown++
+                        printf "  %-8s %-14s %s\n", $1, human($2), $3
+                    }
                 }
                 END {
-                    if (limit > 0 && NR > limit) {
-                        printf "  ... %d repeated port rows hidden by PORT_LIMIT\n", NR - limit
+                    if (limit > 0 && total > limit) {
+                        printf "  ... %d repeated port rows hidden by PORT_LIMIT\n", total - limit
                     }
                 }'
         fi
@@ -251,15 +317,19 @@ emit_port_rows() {
                 | awk -v limit="$PORT_LIMIT" '
                 BEGIN {
                     shown=0
+                    total=0
                     printf "  %-8s %s\n", "HITS", "PROTO/PORT"
                 }
-                limit == 0 || shown < limit {
-                    shown++
-                    printf "  %-8s %s\n", $1, $2
+                {
+                    total++
+                    if (limit == 0 || shown < limit) {
+                        shown++
+                        printf "  %-8s %s\n", $1, $2
+                    }
                 }
                 END {
-                    if (limit > 0 && NR > limit) {
-                        printf "  ... %d repeated port rows hidden by PORT_LIMIT\n", NR - limit
+                    if (limit > 0 && total > limit) {
+                        printf "  ... %d repeated port rows hidden by PORT_LIMIT\n", total - limit
                     }
                 }'
         fi
@@ -272,15 +342,15 @@ emit_port_rows() {
 
 report_top_ip_details() {
     csv_file="$1"
-    start_local="$2"
-    end_local="$3"
+    start_epoch="$2"
+    end_epoch="$3"
 
     len_seen="$(awk -F',' 'NF>=5 && $5 ~ /^[0-9]+$/ {seen=1} END {print seen+0}' "$csv_file")"
 
     line
     echo "TOP ${TOP_N} IP DETAILS: PORTS + ACTIVE TIME RANGE ${REPORT_TZ_LABEL}"
     line
-    echo "Range     : $(format_range_time "$start_local") -> $(format_range_time "$end_local") ${REPORT_TZ_LABEL}"
+    echo "Range     : $(format_epoch_range "$start_epoch") -> $(format_epoch_range "$end_epoch") ${REPORT_TZ_LABEL}"
     echo "Log prefix: $LOG_PREFIX"
 
     if [ "$len_seen" -eq 1 ]; then
@@ -324,10 +394,34 @@ report_top_ip_details() {
     done
 }
 
+show_no_data_help() {
+    title="$1"
+    start_epoch="$2"
+    end_epoch="$3"
+
+    line
+    echo "NO CONNECTION LOGS FOUND"
+    line
+    echo "Report     : $title"
+    echo "Range      : $(format_epoch_range "$start_epoch") -> $(format_epoch_range "$end_epoch") ${REPORT_TZ_LABEL}"
+    echo "Epoch range: $start_epoch -> $end_epoch"
+    echo "Log prefix : $LOG_PREFIX"
+    echo ""
+    echo "Try:"
+    echo "  journalctl -k -o short-unix --no-pager | grep -F '$LOG_PREFIX' | tail"
+    echo "  nft list ruleset | grep log"
+    echo ""
+    echo "If the first command shows rows but this report is empty, run:"
+    echo "  REPORT_TZ=Asia/Shanghai bash /root/nft_conn_report_top10_utc8_folded_v2.sh status"
+}
+
 run_report() {
     title="$1"
     start_local="$2"
     end_local="$3"
+
+    start_epoch="$(to_epoch "$start_local")"
+    end_epoch="$(to_epoch "$end_local")"
 
     clear || true
 
@@ -335,24 +429,15 @@ run_report() {
     tmp_csv="$(mktemp)"
     trap 'rm -f "$tmp_raw" "$tmp_csv"' EXIT
 
-    get_journal_logs "$start_local" "$end_local" > "$tmp_raw"
+    get_journal_logs "$start_epoch" "$end_epoch" "$tmp_raw"
     extract_logs_csv < "$tmp_raw" > "$tmp_csv"
 
     if [ ! -s "$tmp_csv" ]; then
-        line
-        echo "NO CONNECTION LOGS FOUND"
-        line
-        echo "Report     : $title"
-        echo "Range      : $(format_range_time "$start_local") -> $(format_range_time "$end_local") ${REPORT_TZ_LABEL}"
-        echo "Log prefix : $LOG_PREFIX"
-        echo ""
-        echo "Try:"
-        echo "  journalctl -k -o short-unix --no-pager | grep 'nft-new:' | tail"
-        echo "  nft list ruleset | grep log"
+        show_no_data_help "$title" "$start_epoch" "$end_epoch"
         return
     fi
 
-    report_top_ip_details "$tmp_csv" "$start_local" "$end_local"
+    report_top_ip_details "$tmp_csv" "$start_epoch" "$end_epoch"
 }
 
 daily_report() {
@@ -400,10 +485,24 @@ print_recent_logs_utc8() {
         done
 }
 
+raw_logs_tail() {
+    line
+    echo "RAW NFT LOGS TAIL, CONVERTED TO ${REPORT_TZ_LABEL}"
+    line
+    print_recent_logs_utc8 || true
+}
+
 check_status() {
     line
     echo "STATUS CHECK"
     line
+
+    now_epoch="$(date '+%s')"
+    echo ""
+    echo "[time]"
+    echo "System local : $(date '+%Y-%m-%d %H:%M:%S %z %Z')"
+    echo "Report TZ    : $(format_epoch "$now_epoch") ${REPORT_TZ_LABEL}"
+    echo "Epoch now    : $now_epoch"
 
     echo ""
     echo "[nftables service]"
@@ -421,14 +520,15 @@ check_status() {
 menu() {
     while true; do
         echo ""
-        echo "===== NFT CONNECTION REPORT TOP10 UTC+8 ====="
+        echo "===== NFT CONNECTION REPORT TOP10 UTC+8 V2 ====="
         echo "1) Daily report"
         echo "2) Weekly report"
         echo "3) Custom date range"
-        echo "4) Status check"
-        echo "5) Help"
-        echo "6) Exit"
-        echo "============================================="
+        echo "4) Show recent raw nft logs"
+        echo "5) Status check"
+        echo "6) Help"
+        echo "7) Exit"
+        echo "================================================"
         read -r -p "Select: " c
 
         case "$c" in
@@ -445,14 +545,18 @@ menu() {
                 pause
                 ;;
             4)
-                check_status
+                raw_logs_tail
                 pause
                 ;;
             5)
-                usage
+                check_status
                 pause
                 ;;
             6)
+                usage
+                pause
+                ;;
+            7)
                 exit 0
                 ;;
             *)
@@ -474,6 +578,9 @@ case "${1:-}" in
     custom)
         custom_report
         ;;
+    raw)
+        raw_logs_tail
+        ;;
     status)
         check_status
         ;;
@@ -488,13 +595,3 @@ case "${1:-}" in
         exit 1
         ;;
 esac
-
-
-
-
-
-
-
-
-
-
