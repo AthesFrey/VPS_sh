@@ -2,6 +2,8 @@
 
 set -e
 
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+
 # Report/output timezone. Asia/Shanghai and Asia/Singapore are both UTC+8.
 REPORT_TZ="${REPORT_TZ:-Asia/Shanghai}"
 REPORT_TZ_LABEL="${REPORT_TZ_LABEL:-}"
@@ -38,20 +40,20 @@ derive_report_tz_label() {
 }
 
 usage() {
-    cat <<'EOF_USAGE'
+    cat <<EOF_USAGE
 Usage:
-  bash /root/nft_conn_report_top10_utc8_folded_v2.sh daily
-  bash /root/nft_conn_report_top10_utc8_folded_v2.sh weekly
-  bash /root/nft_conn_report_top10_utc8_folded_v2.sh custom
-  bash /root/nft_conn_report_top10_utc8_folded_v2.sh status
-  bash /root/nft_conn_report_top10_utc8_folded_v2.sh raw
+  bash "$SCRIPT_PATH" daily
+  bash "$SCRIPT_PATH" weekly
+  bash "$SCRIPT_PATH" custom
+  bash "$SCRIPT_PATH" status
+  bash "$SCRIPT_PATH" raw
 
 Optional environment variables:
-  LOG_PREFIX='nft-new:' bash /root/nft_conn_report_top10_utc8_folded_v2.sh daily
-  TOP_N=20 bash /root/nft_conn_report_top10_utc8_folded_v2.sh daily
-  PORT_LIMIT=20 bash /root/nft_conn_report_top10_utc8_folded_v2.sh daily
-  REPORT_TZ=Asia/Singapore bash /root/nft_conn_report_top10_utc8_folded_v2.sh daily
-  REPORT_TZ=Asia/Tokyo REPORT_TZ_LABEL=UTC+9 bash /root/nft_conn_report_top10_utc8_folded_v2.sh daily
+  LOG_PREFIX='nft-new:' bash "$SCRIPT_PATH" daily
+  TOP_N=20 bash "$SCRIPT_PATH" daily
+  PORT_LIMIT=20 bash "$SCRIPT_PATH" daily
+  REPORT_TZ=Asia/Singapore bash "$SCRIPT_PATH" daily
+  REPORT_TZ=Asia/Tokyo REPORT_TZ_LABEL=UTC+9 bash "$SCRIPT_PATH" daily
 
 Defaults:
   TOP_N=10
@@ -447,7 +449,7 @@ show_no_data_help() {
     echo "  nft list ruleset | grep log"
     echo ""
     echo "If the first command shows rows but this report is empty, run:"
-    echo "  REPORT_TZ=Asia/Shanghai bash /root/nft_conn_report_top10_utc8_folded_v2.sh status"
+    echo "  REPORT_TZ=Asia/Shanghai bash \"$SCRIPT_PATH\" status"
 }
 
 run_report() {
@@ -504,6 +506,14 @@ custom_report() {
 
     start="$s 00:00:00"
     end="$e 23:59:59"
+
+    start_epoch="$(to_epoch "$start")"
+    end_epoch="$(to_epoch "$end")"
+    if [ "$start_epoch" -gt "$end_epoch" ]; then
+        echo "[ERROR] start date must be before or equal to end date"
+        return
+    fi
+
     run_report "CUSTOM NFT CONNECTION REPORT" "$start" "$end"
 }
 
