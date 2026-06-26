@@ -663,12 +663,10 @@ EOF_NFT
             ;;
         table_only|"")
             cat >> "$out" <<EOF_NFT
-# Mode: Normal Apply. This preserves foreign tables and replaces only the managed table.
-# It avoids global 'flush ruleset' so Docker/NAT/port-jump tables are not cleared.
-
-# Delete the managed table if it already exists; do nothing if it does not exist.
-# Requires a reasonably modern nftables with 'destroy' support.
-destroy table $MGR_FAMILY $MGR_TABLE
+# Mode: Normal Apply. This preserves foreign tables.
+# This file intentionally does not contain global 'flush ruleset'.
+# The running managed table is deleted by the shell script just before loading,
+# so this config remains compatible with older nftables versions that lack 'destroy table'.
 
 EOF_NFT
             ;;
@@ -739,7 +737,24 @@ build_unified_config() {
 
 check_nft_config() {
     tmp="$1"
-    nft -c -f "$tmp"
+    uses_full_flush="${2:-0}"
+
+    if [ "$uses_full_flush" = "1" ]; then
+        nft -c -f "$tmp"
+        return $?
+    fi
+
+    # Normal Apply config no longer contains 'flush ruleset' or 'destroy table'.
+    # To avoid false "table/chain already exists" syntax-check failures on machines
+    # where the managed table is already active, check the same generated rules under
+    # a temporary table name. The real managed table is deleted only after this check passes.
+    check_tmp="$(mktemp)"
+    check_table="${MGR_TABLE}_check_$$"
+    sed "s/^table[[:space:]]\+$MGR_FAMILY[[:space:]]\+$MGR_TABLE[[:space:]]*{/table $MGR_FAMILY $check_table {/" "$tmp" > "$check_tmp"
+    nft -c -f "$check_tmp"
+    rc=$?
+    rm -f "$check_tmp"
+    return "$rc"
 }
 
 apply_config_file() {
@@ -750,13 +765,10 @@ apply_config_file() {
     had_old_conf=0
 
     echo "[+] Checking nftables config syntax..."
-    if ! check_nft_config "$tmp"; then
+    if ! check_nft_config "$tmp" "$uses_full_flush"; then
         rm -f "$backup_conf"
         echo "[ERROR] Config check failed. Nothing changed."
-        if grep -q '^destroy table ' "$tmp" 2>/dev/null; then
-            echo "[HINT] Normal Apply uses 'destroy table' to replace only the managed table."
-            echo "[HINT] If your nftables is too old for this syntax, upgrade nftables before applying."
-        fi
+        echo "[HINT] Config syntax failed before applying. Active rules were not changed."
         return 1
     fi
 
@@ -782,6 +794,11 @@ apply_config_file() {
         configure_journal_limit
     else
         echo "[INFO] Skipping journal/logrotate changes. Use menu 9 if needed."
+    fi
+
+    if [ "$uses_full_flush" != "1" ]; then
+        echo "[+] Removing old managed table if it exists: $MGR_FAMILY $MGR_TABLE"
+        nft delete table "$MGR_FAMILY" "$MGR_TABLE" >/dev/null 2>&1 || true
     fi
 
     echo "[+] Loading nftables directly with nft -f..."
@@ -1150,15 +1167,14 @@ Main behavior in this version:
        $NFT_CONF
   2. Manages one nft table:
        $MGR_FAMILY $MGR_TABLE
-  3. Normal Apply does NOT use global flush ruleset. It uses:
-       destroy table $MGR_FAMILY $MGR_TABLE
-     then rebuilds only that managed table. Foreign tables created by Docker,
-     iptables-nft, sing-box NAT, DNAT, etc. are preserved.
+  3. Normal Apply does NOT use global flush ruleset.
+     It deletes only this script's managed table in the running ruleset, then reloads it.
+     Foreign tables created by Docker, iptables-nft, sing-box NAT, DNAT, etc. are preserved.
   4. Emergency Initialize still uses:
        flush ruleset
      to recover to one clean baseline ruleset.
   5. Input chain default is drop, with explicit allow rules for saved TCP/UDP ports.
-  6. Forward is drop. Output is accept.
+  6. Forward is drop by default, with Docker bridge forwarding compatibility. Output is accept.
   7. Emergency Initialize resets to TCP 22,80,443 and empty UDP.
 
 Why this is different from the old own-table script:
@@ -1326,3 +1342,4 @@ main() {
 if [ "${NFTFW_MANAGER_TESTING:-0}" != "1" ]; then
     main "$@"
 fi
+
