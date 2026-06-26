@@ -8,6 +8,7 @@
 # Main design:
 # - Normal Apply writes /etc/nftables.conf and reloads nftables directly with nft -f.
 # - Normal Apply does NOT use `flush ruleset`; it replaces only the managed table.
+# - Forward chain keeps policy drop but allows Docker published DNAT and container outbound traffic.
 # - Emergency Initialize still uses `flush ruleset` to recover to a clean baseline.
 # - Port lists are stored in /etc/nft_ports_tcp.list and /etc/nft_ports_udp.list.
 # - Emergency Initialize resets TCP to 22,80,443 and UDP to empty.
@@ -708,6 +709,17 @@ EOF_NFT
 
     chain forward {
         type filter hook forward priority 0; policy drop;
+
+        ct state established,related accept comment "nftfw: forward established related"
+        ct state invalid drop comment "nftfw: forward invalid"
+
+        # Docker compatibility for published ports and container outbound traffic.
+        # Docker bridge IPv4 subnets normally live inside 172.16.0.0/12,
+        # for example default bridge 172.17.0.0/16 and user bridges 172.18.0.0/16+.
+        # These rules prevent this manager's forward policy drop from blocking Docker DNAT.
+        ct status dnat ip daddr 172.16.0.0/12 accept comment "nftfw: allow docker published dnat"
+        ip saddr 172.16.0.0/12 accept comment "nftfw: allow docker outbound forward"
+
         counter drop comment "nftfw: forward drop"
     }
 
