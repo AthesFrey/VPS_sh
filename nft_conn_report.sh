@@ -11,6 +11,7 @@ REPORT_TZ_LABEL="${REPORT_TZ_LABEL:-}"
 LOG_PREFIX="${LOG_PREFIX:-nft-new:}"
 TOP_N="${TOP_N:-10}"
 PORT_LIMIT="${PORT_LIMIT:-0}"
+PORT_EXCLUDE_LIST="${PORT_EXCLUDE_LIST:-}"
 
 has_cmd() {
     command -v "$1" >/dev/null 2>&1
@@ -230,6 +231,66 @@ extract_logs_csv() {
     '
 }
 
+filter_csv_excluded_ports() {
+    csv_file="$1"
+    exclude_ports="$2"
+
+    if [ -z "$exclude_ports" ]; then
+        cat "$csv_file"
+        return
+    fi
+
+    awk -F',' -v exclude_ports="$exclude_ports" '
+    BEGIN {
+        split(exclude_ports, p, " ")
+        for (i in p) {
+            if (p[i] != "") {
+                excluded[p[i]]=1
+            }
+        }
+    }
+    NF>=4 {
+        if (!($4 in excluded)) {
+            print $0
+        }
+    }' "$csv_file"
+}
+
+show_port_filter_menu() {
+    while true; do
+        echo ""
+        echo "Select port filter:"
+        echo "1) All ports TOP${TOP_N}"
+        echo "2) Exclude 443 TOP${TOP_N}"
+        echo "3) Exclude 443, 22 TOP${TOP_N}"
+        echo "4) Exclude 443, 22, 80 TOP${TOP_N}"
+        echo "================================================"
+        read -r -p "Select: " pf
+
+        case "$pf" in
+            1)
+                PORT_EXCLUDE_LIST=""
+                break
+                ;;
+            2)
+                PORT_EXCLUDE_LIST="443"
+                break
+                ;;
+            3)
+                PORT_EXCLUDE_LIST="443 22"
+                break
+                ;;
+            4)
+                PORT_EXCLUDE_LIST="443 22 80"
+                break
+                ;;
+            *)
+                echo "invalid"
+                ;;
+        esac
+    done
+}
+
 human_bytes() {
     awk -v b="${1:-0}" 'BEGIN {
         split("B KiB MiB GiB TiB PiB", u, " ")
@@ -379,6 +440,11 @@ report_top_ip_details() {
     line
     echo "Range     : $(format_epoch_range "$start_epoch") -> $(format_epoch_range "$end_epoch") ${REPORT_TZ_LABEL}"
     echo "Log prefix: $LOG_PREFIX"
+    if [ -z "$PORT_EXCLUDE_LIST" ]; then
+        echo "Port filter: all ports"
+    else
+        echo "Port filter: exclude DPT ports = $PORT_EXCLUDE_LIST"
+    fi
 
     if [ "$len_seen" -eq 1 ]; then
         total_bytes="$(awk -F',' 'NF>=5 && $5 ~ /^[0-9]+$/ {sum+=$5} END {print sum+0}' "$csv_file")"
@@ -443,6 +509,11 @@ show_no_data_help() {
     echo "Range      : $(format_epoch_range "$start_epoch") -> $(format_epoch_range "$end_epoch") ${REPORT_TZ_LABEL}"
     echo "Epoch range: $start_epoch -> $end_epoch"
     echo "Log prefix : $LOG_PREFIX"
+    if [ -z "$PORT_EXCLUDE_LIST" ]; then
+        echo "Port filter: all ports"
+    else
+        echo "Port filter: exclude DPT ports = $PORT_EXCLUDE_LIST"
+    fi
     echo ""
     echo "Try:"
     echo "  journalctl -k -o short-unix --no-pager | grep -F '$LOG_PREFIX' | tail"
@@ -465,19 +536,21 @@ run_report() {
     fi
 
     tmp_raw="$(mktemp)"
+    tmp_csv_all="$(mktemp)"
     tmp_csv="$(mktemp)"
 
     get_journal_logs "$start_epoch" "$end_epoch" "$tmp_raw"
-    extract_logs_csv < "$tmp_raw" > "$tmp_csv"
+    extract_logs_csv < "$tmp_raw" > "$tmp_csv_all"
+    filter_csv_excluded_ports "$tmp_csv_all" "$PORT_EXCLUDE_LIST" > "$tmp_csv"
 
     if [ ! -s "$tmp_csv" ]; then
         show_no_data_help "$title" "$start_epoch" "$end_epoch"
-        rm -f "$tmp_raw" "$tmp_csv"
+        rm -f "$tmp_raw" "$tmp_csv_all" "$tmp_csv"
         return
     fi
 
     report_top_ip_details "$tmp_csv" "$start_epoch" "$end_epoch"
-    rm -f "$tmp_raw" "$tmp_csv"
+    rm -f "$tmp_raw" "$tmp_csv_all" "$tmp_csv"
 }
 
 daily_report() {
@@ -581,10 +654,12 @@ menu() {
 
         case "$c" in
             1)
+                show_port_filter_menu
                 daily_report
                 pause
                 ;;
             2)
+                show_port_filter_menu
                 weekly_report
                 pause
                 ;;
