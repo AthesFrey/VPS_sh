@@ -12,6 +12,10 @@ LOG_PREFIX="${LOG_PREFIX:-nft-new:}"
 TOP_N="${TOP_N:-10}"
 PORT_LIMIT="${PORT_LIMIT:-0}"
 PORT_EXCLUDE_LIST="${PORT_EXCLUDE_LIST:-}"
+# Enable ip-api.com GeoIP lookup by default. Set IP_API_GEO=0 to disable.
+IP_API_GEO="${IP_API_GEO:-1}"
+IP_API_CONNECT_TIMEOUT="${IP_API_CONNECT_TIMEOUT:-1}"
+IP_API_MAX_TIME="${IP_API_MAX_TIME:-2}"
 
 has_cmd() {
     command -v "$1" >/dev/null 2>&1
@@ -53,6 +57,8 @@ Optional environment variables:
   LOG_PREFIX='nft-new:' bash "$SCRIPT_PATH" daily
   TOP_N=20 bash "$SCRIPT_PATH" daily
   PORT_LIMIT=20 bash "$SCRIPT_PATH" daily
+  IP_API_GEO=0 bash "$SCRIPT_PATH" daily
+  IP_API_CONNECT_TIMEOUT=1 IP_API_MAX_TIME=2 bash "$SCRIPT_PATH" daily
   REPORT_TZ=Asia/Singapore bash "$SCRIPT_PATH" daily
   REPORT_TZ=Asia/Tokyo REPORT_TZ_LABEL=UTC+9 bash "$SCRIPT_PATH" daily
 
@@ -62,6 +68,10 @@ Defaults:
                       Ports with HITS=1 are always folded and not listed.
   REPORT_TZ=Asia/Shanghai
   REPORT_TZ_LABEL is auto-derived from REPORT_TZ unless explicitly set
+  IP_API_GEO=1        Show Geo line for each TOP IP using ip-api.com.
+                      Set IP_API_GEO=0 to disable.
+  IP_API_CONNECT_TIMEOUT=1
+  IP_API_MAX_TIME=2   Keep API failures/timeouts from blocking the report too long.
 
 Timezone note:
   This script converts the requested report range to Unix epoch seconds in REPORT_TZ.
@@ -291,6 +301,80 @@ show_port_filter_menu() {
     done
 }
 
+
+json_get_string() {
+    json_text="$1"
+    key_name="$2"
+
+    printf '%s\n' "$json_text" \
+        | sed -n 's/.*"'"$key_name"'"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p' \
+        | head -n 1
+}
+
+lookup_ip_geo() {
+    ip="$1"
+
+    if [ "${IP_API_GEO:-1}" = "0" ]; then
+        return
+    fi
+
+    if ! has_cmd curl; then
+        echo "Geo: unknown"
+        return
+    fi
+
+    api_url="http://ip-api.com/json/${ip}?lang=zh-CN&fields=status,message,country,regionName,city,district,isp,org,as,query"
+    api_resp="$(curl -fsS --connect-timeout "$IP_API_CONNECT_TIMEOUT" --max-time "$IP_API_MAX_TIME" "$api_url" 2>/dev/null || true)"
+
+    if [ -z "$api_resp" ]; then
+        echo "Geo: unknown"
+        return
+    fi
+
+    status="$(json_get_string "$api_resp" "status")"
+    if [ "$status" != "success" ]; then
+        echo "Geo: unknown"
+        return
+    fi
+
+    country="$(json_get_string "$api_resp" "country")"
+    region="$(json_get_string "$api_resp" "regionName")"
+    city="$(json_get_string "$api_resp" "city")"
+    district="$(json_get_string "$api_resp" "district")"
+    isp="$(json_get_string "$api_resp" "isp")"
+    org="$(json_get_string "$api_resp" "org")"
+
+    geo_text=""
+    for part in "$country" "$region" "$city" "$district"; do
+        if [ -n "$part" ] && [ "$part" != "null" ]; then
+            case " $geo_text " in
+                *" $part "*) ;;
+                *) geo_text="${geo_text:+$geo_text }$part" ;;
+            esac
+        fi
+    done
+
+    net_text=""
+    for part in "$isp" "$org"; do
+        if [ -n "$part" ] && [ "$part" != "null" ]; then
+            case " $net_text " in
+                *" $part "*) ;;
+                *) net_text="${net_text:+$net_text / }$part" ;;
+            esac
+        fi
+    done
+
+    if [ -z "$geo_text" ]; then
+        geo_text="unknown"
+    fi
+
+    if [ -n "$net_text" ]; then
+        echo "Geo: $geo_text | ISP/ORG: $net_text"
+    else
+        echo "Geo: $geo_text"
+    fi
+}
+
 human_bytes() {
     awk -v b="${1:-0}" 'BEGIN {
         split("B KiB MiB GiB TiB PiB", u, " ")
@@ -474,6 +558,7 @@ report_top_ip_details() {
 
         echo ""
         echo "IP: $ip"
+        lookup_ip_geo "$ip"
         echo "Hits: $hits"
 
         if [ "$len_seen" -eq 1 ]; then
@@ -664,6 +749,7 @@ menu() {
                 pause
                 ;;
             3)
+                PORT_EXCLUDE_LIST=""
                 custom_report
                 pause
                 ;;
@@ -718,4 +804,3 @@ case "${1:-}" in
         exit 1
         ;;
 esac
-
