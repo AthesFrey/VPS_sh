@@ -274,6 +274,7 @@ show_port_filter_menu() {
         echo "2) Exclude 443 TOP${TOP_N}"
         echo "3) Exclude 443, 22 TOP${TOP_N}"
         echo "4) Exclude 443, 22, 80 TOP${TOP_N}"
+        echo "5) Exclude 443, 22, 80, 81 TOP${TOP_N}"
         echo "================================================"
         read -r -p "Select: " pf
 
@@ -292,6 +293,10 @@ show_port_filter_menu() {
                 ;;
             4)
                 PORT_EXCLUDE_LIST="443 22 80"
+                break
+                ;;
+            5)
+                PORT_EXCLUDE_LIST="443 22 80 81"
                 break
                 ;;
             *)
