@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Realm 安装 / 升级 / 卸载 / 节点管理脚本 v4.0
+# Realm 安装 / 升级 / 卸载 / 节点管理脚本 v4.1
 # 面向 Realm 2.9.x 当前配置与发布格式，不包含旧配置转换逻辑。
 
 set -Eeuo pipefail
@@ -19,7 +19,6 @@ RELEASE_JSON=""
 LATEST_TAG=""
 LATEST_ASSET_URL=""
 LATEST_SHA256=""
-ARCHIVE_MEMBER=""
 
 CURL_CONNECT_TIMEOUT="${CURL_CONNECT_TIMEOUT:-10}"
 REALM_MAXTIME="${REALM_MAXTIME:-120}"
@@ -229,7 +228,7 @@ download_archive() {
 }
 
 extract_and_verify_binary() {
-  local archive_list members member_count version_output
+  local archive_list members member_count archive_member version_output
 
   if ! archive_list="$(tar -tzf "${TGZ_PATH}" 2>/dev/null)"; then
     err "发行包不是有效的 tar.gz 文件。"
@@ -247,10 +246,10 @@ extract_and_verify_binary() {
     err "发行包内没有唯一的 realm 可执行文件。"
     return 1
   fi
-  ARCHIVE_MEMBER="$(command printf '%s\n' "${members}" | sed -n '1p')"
+  archive_member="$(command printf '%s\n' "${members}" | sed -n '1p')"
 
   # 只读取目标文件内容，不恢复压缩包中的构建机 UID/GID。
-  if ! tar -xOzf "${TGZ_PATH}" "${ARCHIVE_MEMBER}" >"${STAGED_BIN}"; then
+  if ! tar -xOzf "${TGZ_PATH}" "${archive_member}" >"${STAGED_BIN}"; then
     err "提取 realm 可执行文件失败。"
     return 1
   fi
@@ -342,16 +341,15 @@ write_default_config_if_missing() {
   fi
 
   candidate="$(mktemp "${CONF_DIR}/config.toml.new.XXXXXX")" || return 1
-  if ! make_default_config "${candidate}" || ! install -m 0644 "${candidate}" "${CONF_FILE}"; then
+  if ! make_default_config "${candidate}" || ! chmod 0644 "${candidate}" || ! mv -f -- "${candidate}" "${CONF_FILE}"; then
     rm -f -- "${candidate}" || true
     return 1
   fi
-  rm -f -- "${candidate}"
   log "已生成 Realm 2.9.x 默认配置：${CONF_FILE}"
 }
 
 write_service() {
-  local candidate backup=""
+  local candidate
 
   mkdir -p "$(dirname "${SERVICE_FILE}")" || return 1
   candidate="$(mktemp "$(dirname "${SERVICE_FILE}")/realm.service.new.XXXXXX")" || return 1
@@ -386,18 +384,10 @@ EOF
     return 0
   fi
 
-  if [[ -e "${SERVICE_FILE}" ]]; then
-    if ! backup="$(backup_file "${SERVICE_FILE}")"; then
-      rm -f -- "${candidate}" || true
-      return 1
-    fi
-  fi
-  if ! install -m 0644 "${candidate}" "${SERVICE_FILE}"; then
+  if ! chmod 0644 "${candidate}" || ! mv -f -- "${candidate}" "${SERVICE_FILE}"; then
     rm -f -- "${candidate}"
-    [[ -n "${backup}" ]] && restore_backup "${backup}" "${SERVICE_FILE}" || true
     return 1
   fi
-  rm -f -- "${candidate}"
   log "已写入 systemd 单元：${SERVICE_FILE}"
 }
 
@@ -440,8 +430,8 @@ install_binary() {
 
 install_or_upgrade() {
   local reset_config="${1:-no}"
-  local asset binary_backup="" config_backup="" config_candidate=""
-  local had_binary=0
+  local asset binary_backup="" config_backup="" service_backup="" config_candidate=""
+  local had_binary=0 had_service=0 was_active=0 was_enabled=0
 
   asset="$(detect_asset)" || return 1
   prepare_workspace
@@ -454,6 +444,12 @@ install_or_upgrade() {
     log "当前版本：$(current_version)"
     binary_backup="$(backup_file "${BIN_PATH}")" || return 1
   fi
+  if [[ -e "${SERVICE_FILE}" ]]; then
+    had_service=1
+    service_backup="$(backup_file "${SERVICE_FILE}")" || return 1
+  fi
+  systemctl is-active --quiet "${APP_NAME}" 2>/dev/null && was_active=1
+  systemctl is-enabled --quiet "${APP_NAME}" 2>/dev/null && was_enabled=1
 
   mkdir -p "${CONF_DIR}" || return 1
   if [[ "${reset_config}" == "yes" ]]; then
@@ -461,11 +457,10 @@ install_or_upgrade() {
       config_backup="$(backup_file "${CONF_FILE}")" || return 1
     fi
     config_candidate="$(mktemp "${CONF_DIR}/config.toml.new.XXXXXX")" || return 1
-    if ! make_default_config "${config_candidate}" || ! install -m 0644 "${config_candidate}" "${CONF_FILE}"; then
+    if ! make_default_config "${config_candidate}" || ! chmod 0644 "${config_candidate}" || ! mv -f -- "${config_candidate}" "${CONF_FILE}"; then
       rm -f -- "${config_candidate}" || true
       return 1
     fi
-    rm -f -- "${config_candidate}"
     log "配置已重置为 Realm 2.9.x 模板。"
   else
     write_default_config_if_missing || return 1
@@ -487,9 +482,21 @@ install_or_upgrade() {
         rm -f -- "${CONF_FILE}"
       fi
     fi
+    if ((had_service)) && [[ -n "${service_backup}" ]]; then
+      restore_backup "${service_backup}" "${SERVICE_FILE}" || true
+    elif ((had_service == 0)); then
+      rm -f -- "${SERVICE_FILE}"
+    fi
     systemctl daemon-reload 2>/dev/null || true
-    if ((had_binary)) && config_has_endpoints; then
+    if ((was_enabled)); then
+      systemctl enable "${APP_NAME}" >/dev/null 2>&1 || true
+    else
+      systemctl disable "${APP_NAME}" >/dev/null 2>&1 || true
+    fi
+    if ((was_active)); then
       systemctl start "${APP_NAME}" 2>/dev/null || true
+    else
+      systemctl stop "${APP_NAME}" 2>/dev/null || true
     fi
     return 1
   fi
@@ -533,7 +540,7 @@ ensure_config() {
 
 # 输出：idx|start|end|remark|listen|remote|udp
 parse_endpoints() {
-  ensure_config || return 1
+  [[ -f "${CONF_FILE}" ]] || return 0
   awk '
     function trim(value) {
       sub(/^[[:space:]]+/, "", value)
@@ -585,6 +592,10 @@ parse_endpoints() {
         udp="false"
         pending_remark=""
         pending_line=0
+        next
+      }
+
+      if (in_block && line ~ /^[[:space:]]*\[endpoints\.network\][[:space:]]*(#.*)?$/) {
         next
       }
 
@@ -724,7 +735,8 @@ commit_config() {
   local backup
 
   backup="$(backup_file "${CONF_FILE}")" || return 1
-  install -m 0644 "${candidate}" "${CONF_FILE}" || return 1
+  chmod 0644 "${candidate}" || return 1
+  mv -f -- "${candidate}" "${CONF_FILE}" || return 1
 
   if restart_after_config_change; then
     log "${description}"
@@ -918,10 +930,9 @@ usage() {
   cat <<EOF
 用法：
   $0                         打开交互菜单
-  $0 --install               安装/重装最新稳定版，保留已有配置
-  $0 --upgrade               升级最新稳定版，保留已有配置
-  $0 --upgrade --reset-config
-                             升级并将配置重置为新版模板
+  $0 --install               安装/升级/重装最新稳定版，保留已有配置
+  $0 --install --reset-config
+                             安装/升级并将配置重置为新版模板
   $0 --uninstall             卸载程序，保留配置
   $0 --uninstall --purge     卸载程序，配置移至带时间戳的备份目录
   $0 --status                查看版本、服务状态和节点
@@ -939,22 +950,20 @@ main_menu() {
 
   while true; do
     echo
-    echo "==== Realm 2.9.x 管理 ===="
-    echo "1) 安装 / 重装最新稳定版（保留配置）"
-    echo "2) 升级最新稳定版（保留配置）【推荐】"
-    echo "3) 升级并重置为新版配置模板"
-    echo "4) 卸载"
-    echo "5) 查看状态与节点"
-    echo "6) 添加转发节点"
-    echo "7) 删除 / 批量删除转发节点"
+    echo "==== Realm 管理 ===="
+    echo "1) 安装 / 升级 / 重装最新稳定版（保留配置）【推荐】"
+    echo "2) 安装 / 升级并重置为新版配置模板"
+    echo "3) 卸载"
+    echo "4) 查看状态与节点"
+    echo "5) 添加转发节点"
+    echo "6) 删除 / 批量删除转发节点"
     echo "q) 退出"
     read -rp "请选择: " option
 
     case "${option}" in
       1) install_or_upgrade "no" ;;
-      2) install_or_upgrade "no" ;;
-      3) install_or_upgrade "yes" ;;
-      4)
+      2) install_or_upgrade "yes" ;;
+      3)
         echo "  1) 卸载程序，保留 ${CONF_DIR}"
         echo "  2) 卸载程序，并将配置移至备份目录"
         read -rp "[1/2，默认 1]: " uninstall_option
@@ -965,9 +974,9 @@ main_menu() {
           uninstall_realm "no"
         fi
         ;;
-      5) show_status ;;
-      6) add_endpoint_interactive ;;
-      7) delete_endpoints_interactive ;;
+      4) show_status ;;
+      5) add_endpoint_interactive ;;
+      6) delete_endpoints_interactive ;;
       q|Q) break ;;
       *) warn "无效选择。" ;;
     esac
@@ -989,16 +998,12 @@ main() {
       main_menu
       ;;
     --install)
-      [[ $# -eq 1 ]] || { err "--install 不接受其他参数。"; return 1; }
-      install_or_upgrade "no"
-      ;;
-    --upgrade)
       if [[ $# -eq 1 ]]; then
         install_or_upgrade "no"
       elif [[ $# -eq 2 && "$2" == "--reset-config" ]]; then
         install_or_upgrade "yes"
       else
-        err "--upgrade 仅支持可选参数 --reset-config。"
+        err "--install 仅支持可选参数 --reset-config。"
         return 1
       fi
       ;;
