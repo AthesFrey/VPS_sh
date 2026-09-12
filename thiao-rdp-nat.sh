@@ -2,6 +2,7 @@ cat > /root/thiao-rdp-nat.sh <<'EOF'
 #!/usr/bin/env bash
 # thiao-rdp-nat.sh — 固化 8097 -> thiao:3389 DNAT，自动探测来宾 IP（libvirt default NAT）
 # 需求：root 运行；宿主为 iptables-nft；libvirt 已安装；建议开启 ip_forward 持久化
+# 部署端口转发用于debian部署Win11系统
 set -euo pipefail
 
 # -------- 可调参数 --------
