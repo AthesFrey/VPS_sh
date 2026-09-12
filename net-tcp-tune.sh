@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # =========================================================
-# BBR+fq TCP 调优 + 冲突清理（/etc/sysctl.d 冲突文件直接删除版）
+# BBR+fq TCP 调优 + 冲突清理（保留非冲突配置）
 # - 计算：BDP(bytes)=Mbps*125*ms；max = min(2*BDP, 3%RAM, 64MB)；向下桶化至 {4,8,16,32,64}MB
 # - 写入：/etc/sysctl.d/999-net-bbr-fq.conf
-# - 清理：注释 /etc/sysctl.conf 的冲突键；直接删除 /etc/sysctl.d/*.conf 中含冲突键的旧文件
+# - 清理：只注释冲突赋值行，并为被修改文件创建时间戳备份
 # - 其他目录（/usr/lib|/lib|/usr/local/lib|/run/sysctl.d）：仅提示不改
 # =========================================================
 
@@ -24,7 +24,7 @@ is_int "$BW_Mbps" || BW_Mbps=1000
 is_num "$RTT_ms"  || RTT_ms=150
 
 SYSCTL_TARGET="/etc/sysctl.d/999-net-bbr-fq.conf"
-KEY_REGEX='^(net\.core\.default_qdisc|net\.core\.rmem_max|net\.core\.wmem_max|net\.core\.rmem_default|net\.core\.wmem_default|net\.ipv4\.tcp_rmem|net\.ipv4\.tcp_wmem|net\.ipv4\.tcp_congestion_control)[[:space:]]*='
+KEY_REGEX='^[[:space:]]*(net\.core\.default_qdisc|net\.core\.rmem_max|net\.core\.wmem_max|net\.core\.rmem_default|net\.core\.wmem_default|net\.ipv4\.tcp_rmem|net\.ipv4\.tcp_wmem|net\.ipv4\.tcp_congestion_control)[[:space:]]*='
 
 note() { echo -e "\033[1;34m[i]\033[0m $*"; }
 ok()   { echo -e "\033[1;32m[OK]\033[0m $*"; }
@@ -86,6 +86,9 @@ comment_conflicts_in_sysctl_conf() {
 }
 
 delete_conflict_files_in_dir() {
+  # Kept as a compatibility shim; never delete a sysctl configuration file.
+  preserve_conflicts_in_dir "$1"
+  return 0
   local dir="$1"
   [ -d "$dir" ] || { ok "$dir 不存在"; return 0; }
   shopt -s nullglob
@@ -93,13 +96,39 @@ delete_conflict_files_in_dir() {
   for f in "$dir"/*.conf; do
     [ "$(readlink -f "$f")" = "$(readlink -f "$SYSCTL_TARGET")" ] && continue
     if grep -Eq "$KEY_REGEX" "$f"; then
-      rm -f -- "$f"
-      note "已删除冲突文件：$f"
+      : # Legacy branch: files are preserved by the v2 implementation.
+      note "已保留冲突文件：$f（兼容分支未执行删除）"
       removed=1
     fi
   done
   shopt -u nullglob
   [ "$removed" -eq 1 ] && ok "$dir 中的冲突文件已删除" || ok "$dir 无需处理"
+}
+
+# Preserve each sysctl.d file and comment only the managed assignments.
+preserve_conflicts_in_dir() {
+  local dir="$1" f tmp backup
+  [ -d "$dir" ] || return 0
+  shopt -s nullglob
+  for f in "$dir"/*.conf; do
+    [ "$(readlink -f "$f")" = "$(readlink -f "$SYSCTL_TARGET")" ] && continue
+    if grep -Eq "$KEY_REGEX" "$f"; then
+      backup="$f.bak.$(date +%F-%H%M%S)"
+      cp -a -- "$f" "$backup"
+      tmp="$(mktemp "$f.tmp.XXXXXX")"
+      awk -v re="$KEY_REGEX" '
+        $0 ~ re && $0 !~ /^[[:space:]]*#/ {
+          print "# disabled by net-tcp-tunev2: " $0
+          next
+        }
+        { print }
+      ' "$f" > "$tmp"
+      install -m 0644 "$tmp" "$f"
+      rm -f -- "$tmp"
+      ok "$f 中的冲突键已注释，备份：$backup"
+    fi
+  done
+  shopt -u nullglob
 }
 
 scan_conflicts_ro() {
@@ -115,10 +144,13 @@ scan_conflicts_ro() {
 
 require_root
 note "步骤A：注释 /etc/sysctl.conf 冲突键"
+if [ -f /etc/sysctl.conf ] && grep -Eq "$KEY_REGEX" /etc/sysctl.conf; then
+  cp -a /etc/sysctl.conf "/etc/sysctl.conf.bak.$(date +%F-%H%M%S)"
+fi
 comment_conflicts_in_sysctl_conf
 
-note "步骤B：删除 /etc/sysctl.d 下含冲突键的旧文件（不备份）"
-delete_conflict_files_in_dir "/etc/sysctl.d"
+note "步骤B：注释 /etc/sysctl.d 下冲突键（保留其他配置）"
+preserve_conflicts_in_dir "/etc/sysctl.d"
 
 note "步骤C：扫描其他目录（只读提示，不改）"
 /usr/bin/true
@@ -178,3 +210,6 @@ echo "==============="
 
 note "复核：查看加载顺序及最终值来源（只读）"
 sysctl --system 2>&1 | grep -nE 'Applying|net\.core\.(rmem|wmem)|net\.core\.default_qdisc|net\.ipv4\.tcp_(rmem|wmem)|tcp_congestion_control' || true
+
+
+
