@@ -11,7 +11,6 @@ set -Eeuo pipefail
 # =========================================================
 
 require_root() { if [ "${EUID:-$(id -u)}" -ne 0 ]; then bad "请以 root 运行"; exit 1; fi; }
-require_root
 
 # EOF（例如误用非交互方式运行）按默认值处理，避免 set -u 下变量未定义。
 MEM_G_INPUT=''; BW_Mbps_INPUT=''; RTT_ms_INPUT=''
@@ -37,7 +36,7 @@ ok()   { echo -e "\033[1;32m[OK]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[!]\033[0m $*"; }
 bad()  { echo -e "\033[1;31m[!!]\033[0m $*"; }
 
-require_root() { if [ "${EUID:-$(id -u)}" -ne 0 ]; then bad "请以 root 运行"; exit 1; fi; }
+require_root
 default_iface(){ ip -o -4 route show to default 2>/dev/null | awk '{print $5}' | head -1 || true; }
 
 # ---- 计算（逐步校验）----
