@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Alist 安装工具 v2.0.0：/opt/alist，HTTP 5268，本地存储 /srv/proj。
+# Alist 安装工具 v3.0.0：/opt/alist，HTTP 5268，媒体库路径运行时设置。
 set -euo pipefail
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
-    printf '%s\n' '用法：以 root 执行 bash install-alist.sh' \
-        '固定安装到 /opt/alist，使用 5268 端口，将 /srv/proj 挂载到 Alist 首页。' \
+    printf '%s\n' '用法：以 root 执行 bash install-alist-v3.sh' \
+        '固定安装到 /opt/alist，使用 5268 端口，运行时输入媒体库目录并挂载到 Alist 首页。' \
         '交互设置管理员密码，并启用 systemd 开机自启。需要 Linux、Python 3.8+ 和 systemd。' \
+        '媒体库目录必须是绝对路径；不存在时自动创建。' \
         '仅支持全新安装；不会覆盖 /opt/alist 或自动迁移旧安装。'
     exit 0
 fi
@@ -48,7 +49,7 @@ class Installer:
         # root 只供隔离测试使用；命令行不提供修改固定路径的选项。
         self.root = Path(root)
         self.target = self.root / 'opt/alist'
-        self.media = self.root / 'srv/proj'
+        self.media = None
         self.unit = self.root / 'etc/systemd/system/alist.service'
         self.proc = None
         self.installed = False
@@ -81,6 +82,8 @@ class Installer:
             raise InstallError('需要正在运行的 systemd；不适用于 Docker 容器或 OpenWrt。')
         if self.target.exists() or self.target.is_symlink():
             raise InstallError(f'{self.target} 已存在。本脚本仅用于全新安装，请先备份并移走原目录。')
+        if self.media is None:
+            raise InstallError('尚未设置媒体库目录。')
         if self.media.exists() and not self.media.is_dir():
             raise InstallError(f'{self.media} 已存在，但不是目录。')
         if self.unit.is_symlink():
@@ -107,6 +110,41 @@ class Installer:
             raise InstallError(f'暂不支持的 CPU 架构：{machine}')
         self.arch = architectures[machine]
 
+    def ask_media_path(self):
+        """Read and validate the media directory before any files are installed."""
+        try:
+            with open('/dev/tty', 'r+', encoding='utf-8', errors='strict') as terminal:
+                print('请输入媒体库目录的绝对路径（不存在时自动创建）：', end='', file=terminal, flush=True)
+                raw = terminal.readline()
+        except (OSError, UnicodeError):
+            raise InstallError('需要交互终端输入媒体库目录，请保存脚本后在终端执行 bash install-alist-v3.sh。') from None
+        if not raw:
+            raise InstallError('未读取到媒体库目录。')
+        raw = raw.rstrip('\r\n')
+        if not raw or not raw.startswith('/'):
+            raise InstallError('媒体库目录必须是非空绝对路径。')
+        if any(character.isspace() for character in raw):
+            raise InstallError('媒体库目录不能包含空白字符。')
+        # 保留隔离测试用 root 参数的语义：命令行 root 为 /，测试 root 映射到临时目录。
+        logical = Path(os.path.normpath(raw))
+        protected_logical = Path('/opt/alist')
+        if logical == Path('/') or logical == protected_logical or protected_logical in logical.parents:
+            raise InstallError('媒体库目录不能是 /、/opt/alist 或其子目录。')
+        sandbox_root = self.root.resolve(strict=False)
+        if self.root == Path('/'):
+            media = logical.resolve(strict=False)
+            protected = protected_logical.resolve(strict=False)
+        else:
+            media = (sandbox_root / logical.relative_to('/')).resolve(strict=False)
+            protected = (sandbox_root / protected_logical.relative_to('/')).resolve(strict=False)
+        if media == sandbox_root:
+            raise InstallError('媒体库目录不能是文件系统根目录。')
+        if media == protected or protected in media.parents:
+            raise InstallError('媒体库目录不能是 /opt/alist 或其子目录。')
+        if media.exists() and not media.is_dir():
+            raise InstallError(f'{media} 已存在，但不是目录。')
+        self.media = media
+
     def ask_password(self):
         try:
             with open('/dev/tty', 'w') as terminal:
@@ -120,7 +158,7 @@ class Installer:
                     else:
                         return password
         except (OSError, EOFError):
-            raise InstallError('需要交互终端输入密码，请保存脚本后在终端执行 bash install-alist.sh。') from None
+            raise InstallError('需要交互终端输入密码，请保存脚本后在终端执行 bash install-alist-v3.sh。') from None
 
     def fetch(self, url, destination):
         for attempt in range(3):
@@ -316,7 +354,6 @@ WantedBy=multi-user.target
             print(f'失败现场保留在 {failed}；媒体目录内容保留。', file=sys.stderr)
 
     def execute(self):
-        self.preflight()
         lock_path = self.root / 'run/lock/alist-installer.lock'
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open('a') as lock:
@@ -324,6 +361,7 @@ WantedBy=multi-user.target
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise InstallError('已有另一个 Alist 安装程序在运行。') from None
+            self.ask_media_path()
             self.preflight()
             password = self.ask_password()
             self.target.parent.mkdir(parents=True, exist_ok=True)
