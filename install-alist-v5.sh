@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Alist 安装工具 v5.0.0：/opt/alist，HTTP 5268，媒体库路径运行时设置。
+# Alist 安装工具 v5.1.0：/opt/alist，HTTP 5268，媒体库路径运行时设置。
 set -euo pipefail
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
-    printf '%s\n' '用法：以 root 执行 bash install-alist-v5.sh' \
+    printf '%s\n' '用法：以 root 执行 bash install-alist-v5.1.sh' \
         '固定安装到 /opt/alist，使用 5268 端口，运行时输入媒体库目录并挂载到 Alist 首页。' \
         '交互设置管理员密码，并启用 systemd 开机自启。需要 Linux、Python 3.8+ 和 systemd。' \
         '媒体库目录必须是绝对路径；不存在时自动创建。' \
@@ -13,7 +13,9 @@ if (( $# != 0 )); then
     printf '%s\n' '不接受路径参数；安装目录固定为 /opt/alist。' >&2
     exit 1
 fi
-command -v python3 >/dev/null || { echo '请先安装 python3 和 ca-certificates。' >&2; exit 1; }
+# The Python installer source is supplied through stdin below. Preserve the
+# caller's original stdin so prompts still work when /dev/tty is unavailable.
+exec 3<&0
 exec python3 - <<'PY_INSTALLER'
 import fcntl
 import getpass
@@ -38,6 +40,17 @@ import uuid
 
 class InstallError(Exception):
     pass
+
+
+def prompt_input():
+    """Open the caller's input stream preserved before the Python heredoc."""
+    try:
+        return os.fdopen(os.dup(3), 'r', encoding='utf-8', errors='strict')
+    except OSError:
+        try:
+            return open('/dev/tty', 'r', encoding='utf-8', errors='strict')
+        except (OSError, UnicodeError):
+            raise InstallError('需要交互终端输入，请在 SSH 终端执行 bash install-alist-v5.1.sh。') from None
 
 
 class Installer:
@@ -113,11 +126,11 @@ class Installer:
     def ask_media_path(self):
         """Read and validate the media directory before any files are installed."""
         try:
-            with open('/dev/tty', 'r+', encoding='utf-8', errors='strict') as terminal:
-                print('请输入媒体库目录的绝对路径（不存在时自动创建）：', end='', file=terminal, flush=True)
+            with prompt_input() as terminal:
+                print('请输入媒体库目录的绝对路径（不存在时自动创建）：', end='', file=sys.stderr, flush=True)
                 raw = terminal.readline()
-        except (OSError, UnicodeError):
-            raise InstallError('需要交互终端输入媒体库目录，请保存脚本后在终端执行 bash install-alist-v5.sh。') from None
+        except (OSError, UnicodeError, InstallError):
+            raise InstallError('需要交互终端输入媒体库目录，请保存脚本后在终端执行 bash install-alist-v5.1.sh。') from None
         if not raw:
             raise InstallError('未读取到媒体库目录。')
         raw = raw.rstrip('\r\n')
@@ -147,18 +160,23 @@ class Installer:
 
     def ask_password(self):
         try:
-            with open('/dev/tty', 'w') as terminal:
-                while True:
-                    password = getpass.getpass('设置管理员密码（至少 8 位）：', stream=terminal)
-                    confirmation = getpass.getpass('再次输入管理员密码：', stream=terminal)
-                    if len(password) < 8:
-                        print('密码至少需要 8 位。', flush=True)
-                    elif password != confirmation:
-                        print('两次密码不一致，请重新输入。', flush=True)
-                    else:
-                        return password
-        except (OSError, EOFError):
-            raise InstallError('需要交互终端输入密码，请保存脚本后在终端执行 bash install-alist-v5.sh。') from None
+            with prompt_input() as terminal:
+                previous_stdin = sys.stdin
+                sys.stdin = terminal
+                try:
+                    while True:
+                        password = getpass.getpass('设置管理员密码（至少 8 位）：', stream=sys.stderr)
+                        confirmation = getpass.getpass('再次输入管理员密码：', stream=sys.stderr)
+                        if len(password) < 8:
+                            print('密码至少需要 8 位。', flush=True)
+                        elif password != confirmation:
+                            print('两次密码不一致，请重新输入。', flush=True)
+                        else:
+                            return password
+                finally:
+                    sys.stdin = previous_stdin
+        except (OSError, EOFError, InstallError):
+            raise InstallError('需要交互终端输入密码，请保存脚本后在终端执行 bash install-alist-v5.1.sh。') from None
 
     def fetch(self, url, destination):
         for attempt in range(3):
@@ -397,3 +415,4 @@ def main():
 if __name__ == '__main__':
     sys.exit(main())
 PY_INSTALLER
+
