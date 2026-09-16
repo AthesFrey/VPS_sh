@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 
 # Unified nftables firewall manager script.
-# Unified nftables firewall manager for VPS use.
 # Default target: one persistent config file and one nft table:
 #   /etc/nftables.conf -> table inet filter
 #
@@ -15,10 +14,12 @@
 
 set -e
 
-SCRIPT_PATH="${0:-nft_firewall_manager.sh}"
+VERSION="2.1.0"
+
+SCRIPT_PATH="${0:-firewall_nft_manager.sh}"
 SCRIPT_NAME="${SCRIPT_PATH##*/}"
 if [ -z "$SCRIPT_NAME" ]; then
-    SCRIPT_NAME="nft_firewall_manager.sh"
+    SCRIPT_NAME="firewall_nft_manager.sh"
 fi
 
 BACKUP_DIR="${BACKUP_DIR:-/etc/nftables.backup}"
@@ -38,7 +39,19 @@ JOURNAL_LIMIT="${JOURNAL_LIMIT:-100M}"
 JOURNAL_DROPIN_DIR="${JOURNAL_DROPIN_DIR:-/etc/systemd/journald.conf.d}"
 JOURNAL_DROPIN_FILE="${JOURNAL_DROPIN_FILE:-$JOURNAL_DROPIN_DIR/99-nft-log-size-limit.conf}"
 LOGROTATE_FILE="${LOGROTATE_FILE:-/etc/logrotate.d/nft-kernel-logs}"
-NFT_BIN="${NFT_BIN:-$(command -v nft 2>/dev/null || echo /usr/sbin/nft)}"
+
+SSH_OLD_PORT=22
+SSH_NEW_PORT=26
+SSHD_CONFIG="${SSHD_CONFIG:-/etc/ssh/sshd_config}"
+SSHD_DROPIN_DIR="${SSHD_DROPIN_DIR:-/etc/ssh/sshd_config.d}"
+SSHD_DROPIN_FILE="${SSHD_DROPIN_FILE:-$SSHD_DROPIN_DIR/99-nftfw-port.conf}"
+FAIL2BAN_CONFIG_DIR="${FAIL2BAN_CONFIG_DIR:-/etc/fail2ban}"
+FAIL2BAN_JAIL_FILE="${FAIL2BAN_JAIL_FILE:-$FAIL2BAN_CONFIG_DIR/jail.d/nftfw-sshd.local}"
+FAIL2BAN_BANTIME="${FAIL2BAN_BANTIME:-1h}"
+FAIL2BAN_FINDTIME="${FAIL2BAN_FINDTIME:-10m}"
+FAIL2BAN_MAXRETRY="${FAIL2BAN_MAXRETRY:-5}"
+
+NFT_BIN=""
 
 # Docker compatibility: Emergency Initialize uses `flush ruleset`.
 # That can remove Docker's iptables-nft/NAT chains.
@@ -61,6 +74,10 @@ has_cmd() {
     command -v "$1" >/dev/null 2>&1
 }
 
+nft_cmd() {
+    "$NFT_BIN" "$@"
+}
+
 need_root() {
     if [ "$(id -u)" -ne 0 ]; then
         echo "[ERROR] Please run as root."
@@ -71,6 +88,9 @@ need_root() {
 ensure_nft() {
     if has_cmd nft; then
         NFT_BIN="$(command -v nft)"
+        return 0
+    elif [ -x /usr/sbin/nft ]; then
+        NFT_BIN=/usr/sbin/nft
         return 0
     fi
 
@@ -88,6 +108,9 @@ ensure_nft() {
 
     if has_cmd nft; then
         NFT_BIN="$(command -v nft)"
+        return 0
+    elif [ -x /usr/sbin/nft ]; then
+        NFT_BIN=/usr/sbin/nft
         return 0
     fi
 
@@ -115,6 +138,7 @@ docker_unit_exists() {
 }
 
 maybe_restart_docker_after_nft() {
+    local mode
     mode="$RESTART_DOCKER_AFTER_NFT"
 
     case "$mode" in
@@ -146,6 +170,7 @@ maybe_restart_docker_after_nft() {
 }
 
 validate_identifier() {
+    local name value
     name="$1"
     value="$2"
 
@@ -192,17 +217,12 @@ init_files() {
 }
 
 backup_file() {
+    local src name
     src="$1"
     name="$2"
 
     if [ -f "$src" ]; then
         cp "$src" "$BACKUP_DIR/$name.$(date +%F-%H%M%S)" || true
-    fi
-}
-
-backup_active_ruleset() {
-    if has_cmd nft; then
-        nft list ruleset > "$BACKUP_DIR/active-ruleset.$(date +%F-%H%M%S).nft" 2>/dev/null || true
     fi
 }
 
@@ -224,6 +244,7 @@ normalize_text() {
 }
 
 valid_item() {
+    local item start end
     item="$1"
 
     case "$item" in
@@ -265,6 +286,7 @@ valid_item() {
 }
 
 item_start() {
+    local item
     item="$1"
     case "$item" in
         *-*)
@@ -277,6 +299,7 @@ item_start() {
 }
 
 item_end() {
+    local item
     item="$1"
     case "$item" in
         *-*)
@@ -289,6 +312,7 @@ item_end() {
 }
 
 csv_canonicalize() {
+    local csv tmp_items tmp_sorted OLDIFS item
     csv="$1"
     tmp_items="$(mktemp)"
     tmp_sorted="$(mktemp)"
@@ -377,6 +401,7 @@ csv_canonicalize() {
 }
 
 csv_from_file() {
+    local file
     file="$1"
 
     if [ ! -s "$file" ]; then
@@ -388,38 +413,32 @@ csv_from_file() {
 }
 
 csv_from_text() {
+    local text
     text="$1"
     csv_canonicalize "$text"
 }
 
 write_csv_file() {
+    local file csv
     file="$1"
     csv="$2"
 
-    : > "$file"
+    csv="$(csv_canonicalize "$csv")" || return 1
+    : > "$file" || return 1
 
-    csv="$(csv_canonicalize "$csv")"
+    [ -n "$csv" ] || return 0
 
-    [ -n "$csv" ] || return
-
-    OLDIFS="$IFS"
-    IFS=','
-
-    for item in $csv; do
-        IFS="$OLDIFS"
-        echo "$item" >> "$file"
-        IFS=','
-    done
-
-    IFS="$OLDIFS"
+    printf '%s\n' "$csv" | tr ',' '\n' > "$file"
 }
 
 nft_set_from_csv() {
+    local csv
     csv="$1"
     printf "%s" "$csv" | sed 's/,/, /g'
 }
 
 csv_contains_port() {
+    local csv port OLDIFS item s e
     csv="$1"
     port="$2"
 
@@ -445,6 +464,7 @@ csv_contains_port() {
 }
 
 csv_subtract() {
+    local current_csv remove_csv
     current_csv="$(csv_canonicalize "$1")"
     remove_csv="$(csv_canonicalize "$2")"
 
@@ -586,11 +606,11 @@ EOF_LOGROTATE
 }
 
 foreign_tables() {
-    if ! has_cmd nft; then
+    if [ -z "$NFT_BIN" ]; then
         return 0
     fi
 
-    nft list tables 2>/dev/null \
+    nft_cmd list tables 2>/dev/null \
         | awk -v family="$MGR_FAMILY" -v table="$MGR_TABLE" '
             $1 == "table" {
                 if (!($2 == family && $3 == table)) {
@@ -601,6 +621,7 @@ foreign_tables() {
 }
 
 show_foreign_tables_warning() {
+    local foreign
     foreign="$(foreign_tables || true)"
     if [ -n "$foreign" ]; then
         echo "[WARN] Active nftables contains tables outside $MGR_FAMILY $MGR_TABLE:"
@@ -613,6 +634,7 @@ show_foreign_tables_warning() {
 }
 
 confirm_if_foreign_tables_exist() {
+    local confirm
     if [ "$SKIP_FOREIGN_TABLE_CONFIRM" = "1" ]; then
         return 0
     fi
@@ -630,10 +652,11 @@ confirm_if_foreign_tables_exist() {
 }
 
 write_unified_nft_conf() {
+    local out mode tcp_ports udp_ports tcp_set udp_set log_prefix_escaped input_policy
     out="$1"
     mode="${2:-table_only}"
-    tcp_ports="$(csv_from_file "$TCP_FILE")"
-    udp_ports="$(csv_from_file "$UDP_FILE")"
+    tcp_ports="$(csv_from_file "$TCP_FILE")" || return 1
+    udp_ports="$(csv_from_file "$UDP_FILE")" || return 1
     tcp_set="$(nft_set_from_csv "$tcp_ports")"
     udp_set="$(nft_set_from_csv "$udp_ports")"
     log_prefix_escaped="$(nft_escape_string "$LOG_PREFIX_NFT")"
@@ -643,8 +666,8 @@ write_unified_nft_conf() {
         input_policy="drop"
     fi
 
-    cat > "$out" <<EOF_NFT
-#!/usr/sbin/nft -f
+    cat > "$out" <<EOF_NFT || return 1
+#!$NFT_BIN -f
 
 # Generated by $SCRIPT_NAME
 # Config file: $NFT_CONF
@@ -653,7 +676,7 @@ EOF_NFT
 
     case "$mode" in
         full_flush)
-            cat >> "$out" <<EOF_NFT
+            cat >> "$out" <<EOF_NFT || return 1
 # Mode: Emergency Initialize. This intentionally flushes the full ruleset.
 # It removes foreign/iptables-nft generated tables, including Docker NAT chains.
 
@@ -662,11 +685,12 @@ flush ruleset
 EOF_NFT
             ;;
         table_only|"")
-            cat >> "$out" <<EOF_NFT
+            cat >> "$out" <<EOF_NFT || return 1
 # Mode: Normal Apply. This preserves foreign tables.
 # This file intentionally does not contain global 'flush ruleset'.
-# The running managed table is deleted by the shell script just before loading,
-# so this config remains compatible with older nftables versions that lack 'destroy table'.
+# Add is idempotent. Delete and recreate happen in the same nft transaction.
+add table $MGR_FAMILY $MGR_TABLE
+delete table $MGR_FAMILY $MGR_TABLE
 
 EOF_NFT
             ;;
@@ -676,7 +700,7 @@ EOF_NFT
             ;;
     esac
 
-    cat >> "$out" <<EOF_NFT
+    cat >> "$out" <<EOF_NFT || return 1
 table $MGR_FAMILY $MGR_TABLE {
     chain input {
         type filter hook input priority 0; policy $input_policy;
@@ -687,16 +711,16 @@ table $MGR_FAMILY $MGR_TABLE {
 EOF_NFT
 
     if [ -n "$tcp_ports" ]; then
-        printf '\n        ct state new tcp dport { %s } log prefix "%s" level info comment "nftfw: log managed tcp"\n' "$tcp_set" "$log_prefix_escaped" >> "$out"
-        printf '        tcp dport { %s } accept comment "nftfw: accept managed tcp"\n' "$tcp_set" >> "$out"
+        printf '\n        ct state new tcp dport { %s } log prefix "%s" level info comment "nftfw: log managed tcp"\n' "$tcp_set" "$log_prefix_escaped" >> "$out" || return 1
+        printf '        tcp dport { %s } accept comment "nftfw: accept managed tcp"\n' "$tcp_set" >> "$out" || return 1
     fi
 
     if [ -n "$udp_ports" ]; then
-        printf '\n        ct state new udp dport { %s } log prefix "%s" level info comment "nftfw: log managed udp"\n' "$udp_set" "$log_prefix_escaped" >> "$out"
-        printf '        udp dport { %s } accept comment "nftfw: accept managed udp"\n' "$udp_set" >> "$out"
+        printf '\n        ct state new udp dport { %s } log prefix "%s" level info comment "nftfw: log managed udp"\n' "$udp_set" "$log_prefix_escaped" >> "$out" || return 1
+        printf '        udp dport { %s } accept comment "nftfw: accept managed udp"\n' "$udp_set" >> "$out" || return 1
     fi
 
-    cat >> "$out" <<EOF_NFT
+    cat >> "$out" <<EOF_NFT || return 1
 
         ip protocol icmp accept comment "nftfw: icmp"
         ip6 nexthdr icmpv6 accept comment "nftfw: icmpv6"
@@ -730,124 +754,603 @@ EOF_NFT
 }
 
 build_unified_config() {
+    local tmp mode
     tmp="$1"
     mode="${2:-table_only}"
     write_unified_nft_conf "$tmp" "$mode"
 }
 
-check_nft_config() {
-    tmp="$1"
-    uses_full_flush="${2:-0}"
-
-    if [ "$uses_full_flush" = "1" ]; then
-        nft -c -f "$tmp"
-        return $?
+# Snapshots include a marker for absent files, so rollback also removes new files.
+snapshot_file() {
+    local src="$1" dst="$2"
+    if [ -e "$src" ] || [ -L "$src" ]; then
+        cp -a -- "$src" "$dst"
+    else
+        : > "$dst.missing"
     fi
+}
 
-    # Normal Apply config no longer contains 'flush ruleset' or 'destroy table'.
-    # To avoid false "table/chain already exists" syntax-check failures on machines
-    # where the managed table is already active, check the same generated rules under
-    # a temporary table name. The real managed table is deleted only after this check passes.
-    check_tmp="$(mktemp)"
-    check_table="${MGR_TABLE}_check_$$"
-    sed "s/^table[[:space:]]\+$MGR_FAMILY[[:space:]]\+$MGR_TABLE[[:space:]]*{/table $MGR_FAMILY $check_table {/" "$tmp" > "$check_tmp"
-    nft -c -f "$check_tmp"
-    rc=$?
-    rm -f "$check_tmp"
+restore_file() {
+    local snapshot="$1" dst="$2"
+    if [ -e "$snapshot" ] || [ -L "$snapshot" ]; then
+        mkdir -p -- "$(dirname "$dst")" || return 1
+        cp -a --remove-destination -- "$snapshot" "$dst"
+    elif [ -f "$snapshot.missing" ]; then
+        rm -f -- "$dst"
+    else
+        echo "[ERROR] Missing backup: $snapshot" >&2
+        return 1
+    fi
+}
+
+atomic_copy() {
+    local src="$1" dst="$2" tmp
+    tmp="$(mktemp "${dst}.nftfw.XXXXXX")" || return 1
+    if ! cat -- "$src" > "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if [ -e "$dst" ]; then
+        if ! chmod --reference="$dst" "$tmp" || ! chown --reference="$dst" "$tmp"; then
+            rm -f -- "$tmp"
+            return 1
+        fi
+    else
+        chmod 644 "$tmp" || { rm -f -- "$tmp"; return 1; }
+    fi
+    mv -f -- "$tmp" "$dst" || { rm -f -- "$tmp"; return 1; }
+}
+
+snapshot_firewall() {
+    local dir="$1"
+    snapshot_file "$NFT_CONF" "$dir/nftables.conf" || return 1
+    snapshot_file "$TCP_FILE" "$dir/tcp.list" || return 1
+    snapshot_file "$UDP_FILE" "$dir/udp.list" || return 1
+    nft_cmd list ruleset > "$dir/active-ruleset.nft" || return 1
+    nft_cmd list tables > "$dir/tables" || return 1
+    if awk -v f="$MGR_FAMILY" -v t="$MGR_TABLE" '
+        $1 == "table" && $2 == f && $3 == t { found=1 }
+        END { exit !found }
+    ' "$dir/tables"; then
+        nft_cmd list table "$MGR_FAMILY" "$MGR_TABLE" > "$dir/managed.nft" || return 1
+    else
+        : > "$dir/managed.nft.missing" || return 1
+    fi
+}
+
+restore_firewall_files() {
+    local dir="$1" failed=0
+    restore_file "$dir/nftables.conf" "$NFT_CONF" || failed=1
+    restore_file "$dir/tcp.list" "$TCP_FILE" || failed=1
+    restore_file "$dir/udp.list" "$UDP_FILE" || failed=1
+    return "$failed"
+}
+
+restore_firewall_rules() {
+    local dir="$1" full="${2:-0}" restore="$1/restore.nft"
+    if [ "$full" = 1 ]; then
+        printf 'flush ruleset\n' > "$restore" || return 1
+        cat "$dir/active-ruleset.nft" >> "$restore" || return 1
+    else
+        printf 'add table %s %s\ndelete table %s %s\n' \
+            "$MGR_FAMILY" "$MGR_TABLE" "$MGR_FAMILY" "$MGR_TABLE" > "$restore" || return 1
+        if [ -f "$dir/managed.nft" ]; then
+            cat "$dir/managed.nft" >> "$restore" || return 1
+        elif [ ! -f "$dir/managed.nft.missing" ]; then
+            return 1
+        fi
+    fi
+    nft_cmd -f "$restore"
+}
+
+apply_config_file() (
+    local config="$1" action_name="$2" full="${3:-0}" dir
+    local runtime_dirty=0 committed=0
+    umask 077
+    if [ "$full" = 1 ]; then
+        confirm_if_foreign_tables_exist || return 1
+    fi
+    dir="$(mktemp -d "$BACKUP_DIR/apply.XXXXXX")" || return 1
+    snapshot_firewall "$dir" || return 1
+
+    finish_apply() {
+        local rc="$?" failed=0
+        trap - EXIT HUP INT TERM
+        if [ "$committed" = 0 ]; then
+            restore_firewall_files "$dir" || failed=1
+            if [ "$runtime_dirty" = 1 ]; then
+                restore_firewall_rules "$dir" "$full" || failed=1
+            fi
+            if [ "$failed" = 1 ]; then
+                echo "[ERROR] Firewall rollback incomplete. Backups: $dir" >&2
+            fi
+            [ "$rc" -ne 0 ] || rc=1
+        fi
+        exit "$rc"
+    }
+    trap finish_apply EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    echo "[+] Checking nftables transaction..."
+    nft_cmd -c -f "$config" || return 1
+    atomic_copy "$config" "$NFT_CONF" || return 1
+    echo "[+] Applying nftables transaction..."
+    runtime_dirty=1
+    if ! nft_cmd -f "$NFT_CONF"; then
+        # nft batches are atomic: a rejected transaction leaves the old rules intact.
+        runtime_dirty=0
+        echo "[ERROR] nft apply failed; restoring saved configuration." >&2
+        return 1
+    fi
+    if has_cmd systemctl && ! systemctl is-enabled --quiet nftables 2>/dev/null; then
+        systemctl enable nftables >/dev/null 2>&1 || true
+    fi
+    if [ "$AUTO_CONFIGURE_LOG_LIMIT" = 1 ]; then
+        configure_journal_limit || echo "[WARN] Could not configure log limits." >&2
+    fi
+    if [ "$full" = 1 ]; then
+        maybe_restart_docker_after_nft
+    fi
+    committed=1
+    echo "[OK] $action_name completed. Backups: $dir"
+)
+
+apply_changes() {
+    local tmp rc=0
+    tmp="$(mktemp)" || return 1
+    if build_unified_config "$tmp" table_only; then
+        apply_config_file "$tmp" Apply 0 || rc=$?
+    else
+        rc=1
+    fi
+    rm -f -- "$tmp"
     return "$rc"
 }
 
-apply_config_file() {
-    tmp="$1"
-    action_name="$2"
-    uses_full_flush="${3:-0}"
-    backup_conf="$(mktemp)"
-    had_old_conf=0
-
-    echo "[+] Checking nftables config syntax..."
-    if ! check_nft_config "$tmp" "$uses_full_flush"; then
-        rm -f "$backup_conf"
-        echo "[ERROR] Config check failed. Nothing changed."
-        echo "[HINT] Config syntax failed before applying. Active rules were not changed."
-        return 1
-    fi
-
-    if [ "$uses_full_flush" = "1" ]; then
-        confirm_if_foreign_tables_exist || {
-            rm -f "$backup_conf"
-            return 1
-        }
-    fi
-
-    backup_active_ruleset
-    backup_persistent_files
-
-    if [ -f "$NFT_CONF" ]; then
-        had_old_conf=1
-        cp "$NFT_CONF" "$backup_conf"
-    fi
-
-    echo "[+] Writing nftables config: $NFT_CONF"
-    cp "$tmp" "$NFT_CONF"
-
-    if [ "$AUTO_CONFIGURE_LOG_LIMIT" = "1" ]; then
-        configure_journal_limit
-    else
-        echo "[INFO] Skipping journal/logrotate changes. Use menu 9 if needed."
-    fi
-
-    if [ "$uses_full_flush" != "1" ]; then
-        echo "[+] Removing old managed table if it exists: $MGR_FAMILY $MGR_TABLE"
-        nft delete table "$MGR_FAMILY" "$MGR_TABLE" >/dev/null 2>&1 || true
-    fi
-
-    echo "[+] Loading nftables directly with nft -f..."
-    echo "[INFO] Not using 'systemctl restart nftables' here, because some nftables.service units run 'flush ruleset' on stop."
-    if nft -f "$NFT_CONF"; then
-        if has_cmd systemctl; then
-            systemctl enable nftables >/dev/null 2>&1 || true
+# Take this snapshot BEFORE editing the list, including when Apply is requested
+# from Add/Remove. A separate --apply keeps the lists saved before that invocation.
+save_ports_with_prompt() (
+    local file="$1" ports="$2" label="$3" dir yn committed=0
+    umask 077
+    dir="$(mktemp -d "$BACKUP_DIR/ports.XXXXXX")" || return 1
+    snapshot_file "$TCP_FILE" "$dir/tcp.list" || return 1
+    snapshot_file "$UDP_FILE" "$dir/udp.list" || return 1
+    finish_port_edit() {
+        local rc="$?"
+        trap - EXIT HUP INT TERM
+        if [ "$committed" = 0 ]; then
+            restore_file "$dir/tcp.list" "$TCP_FILE" || echo "[ERROR] TCP list restore failed: $dir" >&2
+            restore_file "$dir/udp.list" "$UDP_FILE" || echo "[ERROR] UDP list restore failed: $dir" >&2
+            [ "$rc" -ne 0 ] || rc=1
         fi
-        if [ "$uses_full_flush" = "1" ]; then
-            maybe_restart_docker_after_nft
-        fi
-        echo "[OK] $action_name completed. Active rules now come from: $NFT_CONF"
-        rm -f "$backup_conf"
-        return 0
-    fi
-
-    echo "[ERROR] nft -f failed. Attempting rollback..."
-    if [ "$had_old_conf" -eq 1 ]; then
-        cp "$backup_conf" "$NFT_CONF"
-        nft -f "$NFT_CONF" || true
-    fi
-    rm -f "$backup_conf"
-    return 1
-}
-
-apply_changes() {
-    tmp="$(mktemp)"
-    build_unified_config "$tmp" "table_only"
-
-    echo "[+] Applying managed nftables table only: $MGR_FAMILY $MGR_TABLE"
-    echo "[INFO] Normal Apply preserves foreign tables and does not use global flush ruleset."
-    if apply_config_file "$tmp" "Apply" "0"; then
-        rm -f "$tmp"
-        echo "[OK] Managed TCP ports: $(csv_from_file "$TCP_FILE")"
-        echo "[OK] Managed UDP ports: $(csv_from_file "$UDP_FILE")"
-        echo "[OK] Note: Normal Apply replaced only the managed table and preserved foreign tables."
-        return 0
-    fi
-
-    rm -f "$tmp"
-    return 1
-}
+        exit "$rc"
+    }
+    trap finish_port_edit EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    write_csv_file "$file" "$ports" || return 1
+    echo "[OK] Saved $label ports:"
+    cat "$file"
+    read -r -p "Apply now? This rewrites $NFT_CONF and reloads only the managed nft table. (y/n): " yn || return 1
+    case "$yn" in
+        y|Y) apply_changes || return 1 ;;
+        *) echo "[INFO] saved but not applied yet" ;;
+    esac
+    committed=1
+)
 
 reset_port_files_to_safe_defaults() {
-    printf "22\n80\n443\n" > "$TCP_FILE"
+    printf "22\n80\n443\n" > "$TCP_FILE" || return 1
     : > "$UDP_FILE"
 }
 
-initialize_nft_safe() {
+detect_ssh_service() {
+    local unit
+    for unit in ssh.service sshd.service; do
+        if [ "$(systemctl show -p LoadState --value "$unit" 2>/dev/null)" = loaded ] &&
+            systemctl is-active --quiet "$unit"; then
+            printf '%s\n' "$unit"
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_sshd_binary() {
+    if has_cmd sshd; then
+        command -v sshd
+    elif [ -x /usr/sbin/sshd ]; then
+        printf '%s\n' /usr/sbin/sshd
+    else
+        return 1
+    fi
+}
+
+effective_sshd_ports() {
+    local config
+    config="$("$1" -T -f "$SSHD_CONFIG")" || return 1
+    awk '$1 == "port" { print $2 }' <<< "$config"
+}
+
+sshd_config_migrated() {
+    local ports
+    ports="$(effective_sshd_ports "$1")" || return 1
+    grep -qx "$SSH_NEW_PORT" <<< "$ports" && ! grep -qx "$SSH_OLD_PORT" <<< "$ports"
+}
+
+ssh_listeners_migrated() {
+    local listeners
+    listeners="$(ss -H -ltnp)" || return 1
+    # ss -p identifies the owner; another application's port 26 is not SSH.
+    awk -v old="$SSH_OLD_PORT" -v new="$SSH_NEW_PORT" '
+        { n=split($4,a,":"); port=a[n] }
+        port == old { old_seen=1 }
+        port == new && /"sshd"/ { new_seen=1 }
+        END { exit !(new_seen && !old_seen) }
+    ' <<< "$listeners"
+}
+
+wait_for_ssh_listeners() {
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        ssh_listeners_migrated && return 0
+        [ "$attempt" -lt 5 ] || break
+        sleep 1
+    done
+    echo "[ERROR] SSH must listen on 26, with no remaining listener on 22." >&2
+    return 1
+}
+
+reload_ssh_service() {
+    # Never fall back to stopping sshd during a remote migration.
+    systemctl reload "$1" && systemctl is-active --quiet "$1"
+}
+
+migration_preflight() {
+    local sshd_bin="$1" unit="$2" socket args pid enabled
+    need_root
+    ensure_systemctl || return 1
+    [ -f /etc/debian_version ] && has_cmd apt-get && has_cmd ss || {
+        echo "[ERROR] Migration requires Debian, apt-get and ss (iproute2)." >&2
+        return 1
+    }
+    [ -n "$NFT_BIN" ] && [ -x "$NFT_BIN" ] && [ -f "$SSHD_CONFIG" ] || return 1
+    for socket in ssh.socket sshd.socket; do
+        if systemctl is-active --quiet "$socket" 2>/dev/null ||
+            systemctl is-enabled --quiet "$socket" 2>/dev/null; then
+            echo "[ERROR] $socket is active/enabled; socket-activated SSH is unsupported." >&2
+            return 1
+        fi
+    done
+    args="$(systemctl show -p ExecStart --value "$unit")" || return 1
+    pid="$(systemctl show -p MainPID --value "$unit")" || return 1
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && [ -r "/proc/$pid/cmdline" ]; then
+        args+=" $(tr '\0' ' ' < "/proc/$pid/cmdline")"
+    fi
+    if [[ "$args" != *sshd* ]] || grep -Eq '(^|[[:space:]])-(f|p|o)' <<< "$args"; then
+        echo "[ERROR] SSH uses an unsupported launcher or command-line configuration override." >&2
+        return 1
+    fi
+    enabled="$(systemctl is-enabled fail2ban.service 2>/dev/null || true)"
+    case "$enabled" in
+        masked*) echo "[ERROR] Fail2ban is masked; migration cancelled." >&2; return 1 ;;
+    esac
+    "$sshd_bin" -t -f "$SSHD_CONFIG" || return 1
+    effective_sshd_ports "$sshd_bin" >/dev/null || return 1
+    nft_cmd list tables >/dev/null || return 1
+    [[ "$FAIL2BAN_MAXRETRY" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ "$FAIL2BAN_BANTIME" =~ ^[0-9]+[smhdw]?$ ]] || return 1
+    [[ "$FAIL2BAN_FINDTIME" =~ ^[0-9]+[smhdw]?$ ]] || return 1
+}
+
+write_sshd_migration_config() {
+    local dir="$1" tmp="$1/sshd_config.new" pattern included=0
+    mkdir -p "$SSHD_DROPIN_DIR" || return 1
+    # Preserve unrelated directives verbatim, including other Port directives.
+    awk -v old="$SSH_OLD_PORT" '
+        {
+            directive=$0
+            sub(/#.*/, "", directive)
+            gsub(/=/, " ", directive)
+            sub(/^[[:space:]]+/, "", directive)
+            split(directive, fields, /[[:space:]]+/)
+            if (tolower(fields[1]) == "port" && fields[2] ~ /^[0-9]+$/ && fields[2]+0 == old)
+                print "# nftfw disabled: " $0
+            else
+                print
+        }
+    ' "$SSHD_CONFIG" > "$tmp" || return 1
+    cat > "$dir/sshd_dropin.new" <<EOF_SSHD
+# Managed by firewall_nft_manager.sh.
+Port $SSH_NEW_PORT
+EOF_SSHD
+    atomic_copy "$dir/sshd_dropin.new" "$SSHD_DROPIN_FILE" || return 1
+    atomic_copy "$tmp" "$SSHD_CONFIG" || return 1
+    # Recognize global Includes, including Debian's usual *.conf wildcard.
+    # Place a missing Include at the beginning, never inside a Match block.
+    while IFS= read -r pattern; do
+        case "$pattern" in
+            /*) ;;
+            *) pattern="/etc/ssh/$pattern" ;;
+        esac
+        # Include operands intentionally use shell-style wildcard matching.
+        # shellcheck disable=SC2254
+        case "$SSHD_DROPIN_FILE" in
+            $pattern) included=1 ;;
+        esac
+    done < <(awk '
+        { sub(/#.*/, ""); gsub(/=/, " ") }
+        tolower($1) == "match" { exit }
+        tolower($1) == "include" {
+            for (i=2; i<=NF; i++) {
+                gsub(/^[\042\047]|[\042\047]$/, "", $i)
+                print $i
+            }
+        }
+    ' "$SSHD_CONFIG")
+    if [ "$included" = 0 ]; then
+        { printf '# Managed SSH port include\nInclude "%s"\n' "$SSHD_DROPIN_FILE"; cat "$SSHD_CONFIG"; } > "$tmp" || return 1
+        atomic_copy "$tmp" "$SSHD_CONFIG" || return 1
+    fi
+}
+
+ensure_fail2ban() {
+    if has_cmd fail2ban-client && has_systemd_journal; then
+        return 0
+    fi
+    echo "[+] Installing Debian Fail2ban and its systemd journal backend..."
+    DEBIAN_FRONTEND=noninteractive apt-get update || return 1
+    DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban python3-systemd || return 1
+    has_cmd fail2ban-client && has_systemd_journal
+}
+
+has_systemd_journal() {
+    /usr/bin/python3 -c 'from systemd import journal' >/dev/null 2>&1
+}
+
+render_fail2ban_jail() {
+    cat <<EOF_FAIL2BAN
+# Managed by firewall_nft_manager.sh.
+[sshd]
+enabled = true
+port = $SSH_NEW_PORT
+filter = sshd
+backend = systemd
+banaction = nftables-multiport
+# Explicit action also overrides any inherited iptables action.
+action = nftables-multiport[name=sshd, port="$SSH_NEW_PORT", protocol=tcp, nftables="$NFT_BIN"]
+bantime = $FAIL2BAN_BANTIME
+findtime = $FAIL2BAN_FINDTIME
+maxretry = $FAIL2BAN_MAXRETRY
+EOF_FAIL2BAN
+}
+
+fail2ban_runtime_ready() {
+    local value expected property
+    has_cmd fail2ban-client || return 1
+    systemctl is-active --quiet fail2ban.service || return 1
+    fail2ban-client status sshd >/dev/null 2>&1 || return 1
+    value="$(fail2ban-client get sshd action nftables-multiport port 2>/dev/null)" || return 1
+    [ "$value" = "$SSH_NEW_PORT" ] || return 1
+    value="$(fail2ban-client get sshd action nftables-multiport nftables 2>/dev/null)" || return 1
+    [ "$value" = "$NFT_BIN" ] || return 1
+    value="$(fail2ban-client get sshd maxretry 2>/dev/null)" || return 1
+    [ "$value" = "$FAIL2BAN_MAXRETRY" ] || return 1
+    for property in bantime findtime; do
+        case "$property" in
+            bantime) expected="$FAIL2BAN_BANTIME" ;;
+            findtime) expected="$FAIL2BAN_FINDTIME" ;;
+        esac
+        expected="$(fail2ban-client --str2sec "$expected")" || return 1
+        value="$(fail2ban-client get sshd "$property" 2>/dev/null)" || return 1
+        [ "$value" = "$expected" ] || return 1
+    done
+}
+
+wait_for_fail2ban() {
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        fail2ban_runtime_ready && return 0
+        [ "$attempt" -lt 5 ] || break
+        sleep 1
+    done
+    echo "[ERROR] Fail2ban sshd jail did not load the expected nftables action/settings." >&2
+    return 1
+}
+
+save_service_state() {
+    local unit="$1" path="$2"
+    systemctl is-active "$unit" > "$path.active" 2>/dev/null || true
+    systemctl is-enabled "$unit" > "$path.enabled" 2>/dev/null || true
+}
+
+restore_service_enablement() {
+    local unit="$1" path="$2" state
+    state="$(cat "$path.enabled")"
+    case "$state" in
+        enabled) systemctl enable "$unit" >/dev/null ;;
+        enabled-runtime) systemctl enable --runtime "$unit" >/dev/null ;;
+        disabled|not-found|'' )
+            if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+                systemctl disable "$unit" >/dev/null
+            fi
+            ;;
+    esac
+}
+
+rollback_ssh_migration() {
+    local failed=0
+    echo "[WARN] Rolling back SSH migration. Backups: $migration_dir"
+    restore_file "$migration_dir/sshd_config" "$SSHD_CONFIG" || failed=1
+    restore_file "$migration_dir/sshd_dropin" "$SSHD_DROPIN_FILE" || failed=1
+    if [ "$fail2ban_touched" = 1 ]; then
+        if [ -d "$migration_dir/fail2ban-config" ]; then
+            cp -a -- "$migration_dir/fail2ban-config/." "$FAIL2BAN_CONFIG_DIR/" || failed=1
+        fi
+        restore_file "$migration_dir/fail2ban_jail" "$FAIL2BAN_JAIL_FILE" || failed=1
+    fi
+    # Restore access before restoring the old listener, without touching other tables.
+    restore_firewall_files "$migration_dir" || failed=1
+    if [ "$firewall_touched" = 1 ]; then
+        restore_firewall_rules "$migration_dir" || failed=1
+    fi
+    if [ "$ssh_touched" = 1 ]; then
+        if "$sshd_bin" -t -f "$SSHD_CONFIG"; then
+            reload_ssh_service "$ssh_unit" || failed=1
+        else
+            failed=1
+        fi
+    fi
+    if [ "$fail2ban_touched" = 1 ]; then
+        if [ "$(cat "$migration_dir/fail2ban.active")" = active ]; then
+            systemctl restart fail2ban.service || failed=1
+        elif [ "$(systemctl show -p LoadState --value fail2ban.service 2>/dev/null)" = loaded ]; then
+            systemctl stop fail2ban.service || failed=1
+        fi
+        restore_service_enablement fail2ban.service "$migration_dir/fail2ban" || failed=1
+    fi
+    restore_service_enablement nftables.service "$migration_dir/nftables" || failed=1
+    if [ "$failed" = 0 ]; then
+        echo "[WARN] Migration rolled back. Newly installed packages were retained."
+    else
+        echo "[ERROR] Rollback incomplete; restore manually from $migration_dir" >&2
+    fi
+    return "$failed"
+}
+
+migrate_ssh_to_new_port() (
+    local confirm sshd_bin ssh_unit migration_dir current_tcp staged_tcp final_tcp
+    local firewall_touched=0 ssh_touched=0 fail2ban_touched=0 committed=0 ssh_ready=0 jail_changed=0
+    # Subshelled traps also handle a caller using 'if migrate...'; every failing
+    # operation is checked explicitly rather than relying on Bash's conditional errexit.
+    read -r -p "Type YES to migrate SSH 22 -> 26 and enable Fail2ban: " confirm || return 1
+    if [ "$confirm" != YES ]; then
+        echo "[INFO] cancelled"
+        return 0
+    fi
+    sshd_bin="$(find_sshd_binary)" || { echo "[ERROR] sshd not found." >&2; return 1; }
+    ssh_unit="$(detect_ssh_service)" || { echo "[ERROR] No active SSH service found." >&2; return 1; }
+    migration_preflight "$sshd_bin" "$ssh_unit" || return 1
+    current_tcp="$(csv_from_file "$TCP_FILE")" || return 1
+    final_tcp="$(csv_subtract "$(csv_from_text "$current_tcp,$SSH_NEW_PORT")" "$SSH_OLD_PORT")" || return 1
+    if sshd_config_migrated "$sshd_bin" && ssh_listeners_migrated; then
+        ssh_ready=1
+    fi
+    if [ "$ssh_ready" = 1 ] && [ "$current_tcp" = "$final_tcp" ] &&
+        cmp -s "$FAIL2BAN_JAIL_FILE" <(render_fail2ban_jail) &&
+        fail2ban_runtime_ready && systemctl is-enabled --quiet fail2ban.service; then
+        # Validate the live managed table too: saved lists alone cannot prove that
+        # a previous interrupted migration actually applied its final firewall.
+        if managed_rules_match; then
+            echo "[OK] SSH 26 and Fail2ban are already configured; no changes needed."
+            return 0
+        fi
+    fi
+
+    umask 077
+    migration_dir="$(mktemp -d "$BACKUP_DIR/ssh-migration.XXXXXX")" || return 1
+    snapshot_firewall "$migration_dir" || return 1
+    snapshot_file "$SSHD_CONFIG" "$migration_dir/sshd_config" || return 1
+    snapshot_file "$SSHD_DROPIN_FILE" "$migration_dir/sshd_dropin" || return 1
+    snapshot_file "$FAIL2BAN_JAIL_FILE" "$migration_dir/fail2ban_jail" || return 1
+    if [ -d "$FAIL2BAN_CONFIG_DIR" ]; then
+        cp -a "$FAIL2BAN_CONFIG_DIR" "$migration_dir/fail2ban-config" || return 1
+    fi
+    save_service_state "$ssh_unit" "$migration_dir/ssh"
+    save_service_state fail2ban.service "$migration_dir/fail2ban"
+    save_service_state nftables.service "$migration_dir/nftables"
+    finish_migration() {
+        local rc="$?"
+        trap - EXIT HUP INT TERM
+        if [ "$committed" = 0 ]; then
+            rollback_ssh_migration || true
+            [ "$rc" -ne 0 ] || rc=1
+        fi
+        exit "$rc"
+    }
+    trap finish_migration EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    echo "[INFO] Migration backups: $migration_dir"
+
+    # An already migrated listener needs only missing firewall/jail repairs.
+    if [ "$ssh_ready" = 0 ]; then
+        staged_tcp="$(csv_from_text "$current_tcp,$SSH_OLD_PORT,$SSH_NEW_PORT")" || return 1
+        firewall_touched=1
+        write_csv_file "$TCP_FILE" "$staged_tcp" || return 1
+        apply_changes || return 1
+        ssh_touched=1
+        write_sshd_migration_config "$migration_dir" || return 1
+        "$sshd_bin" -t -f "$SSHD_CONFIG" || return 1
+        if ! sshd_config_migrated "$sshd_bin"; then
+            echo "[ERROR] Effective SSH configuration still includes port 22 or lacks port 26." >&2
+            return 1
+        fi
+        reload_ssh_service "$ssh_unit" || return 1
+        wait_for_ssh_listeners || return 1
+        sshd_config_migrated "$sshd_bin" || return 1
+    elif ! csv_contains_port "$current_tcp" "$SSH_NEW_PORT" || ! managed_rules_match; then
+        firewall_touched=1
+        write_csv_file "$TCP_FILE" "$(csv_from_text "$current_tcp,$SSH_NEW_PORT")" || return 1
+        apply_changes || return 1
+    fi
+
+    fail2ban_touched=1
+    ensure_fail2ban || return 1
+    mkdir -p "$(dirname "$FAIL2BAN_JAIL_FILE")" || return 1
+    render_fail2ban_jail > "$migration_dir/fail2ban_jail.new" || return 1
+    if ! cmp -s "$FAIL2BAN_JAIL_FILE" "$migration_dir/fail2ban_jail.new"; then
+        atomic_copy "$migration_dir/fail2ban_jail.new" "$FAIL2BAN_JAIL_FILE" || return 1
+        jail_changed=1
+    fi
+    fail2ban-client -t || return 1
+    if systemctl is-active --quiet fail2ban.service; then
+        if [ "$jail_changed" = 1 ] || ! fail2ban_runtime_ready; then
+            # Restart the jail (not other jails) to replace an old backend/action.
+            fail2ban-client reload --restart sshd || return 1
+        fi
+    else
+        systemctl start fail2ban.service || return 1
+    fi
+    if ! systemctl is-enabled --quiet fail2ban.service; then
+        systemctl enable fail2ban.service || return 1
+    fi
+    wait_for_fail2ban || return 1
+    if [ "$(csv_from_file "$TCP_FILE")" != "$final_tcp" ] || ! managed_rules_match; then
+        firewall_touched=1
+        write_csv_file "$TCP_FILE" "$final_tcp" || return 1
+        apply_changes || return 1
+    fi
+    sshd_config_migrated "$sshd_bin" && ssh_listeners_migrated && fail2ban_runtime_ready || return 1
+    committed=1
+    echo "[OK] SSH uses TCP 26; TCP 22 is closed. Fail2ban sshd jail is active."
+)
+
+# A saved list is not proof that the last firewall application completed.
+managed_rules_match() {
+    local rules live expected proto file
+    rules="$(nft_cmd -nn list table "$MGR_FAMILY" "$MGR_TABLE" 2>/dev/null)" || return 1
+    for proto in tcp udp; do
+        file="$TCP_FILE"
+        [ "$proto" = tcp ] || file="$UDP_FILE"
+        live="$(printf '%s\n' "$rules" \
+            | sed -n "/comment \"nftfw: accept managed $proto\"/s/.*$proto dport \(.*\) accept comment.*/\1/p" \
+            | tr -d '{} ')"
+        [ "$(csv_from_text "$live")" = "$(csv_from_file "$file")" ] || return 1
+    done
+    expected="drop"
+    [ "$INPUT_POLICY_DROP" = 1 ] || expected="accept"
+    grep -Eq "hook input priority (filter|0); policy $expected;" <<< "$rules" || return 1
+    grep -Fq 'comment "nftfw: log unmanaged new"' <<< "$rules" || return 1
+    grep -Fq "log prefix \"$(nft_escape_string "$LOG_PREFIX_NFT")\"" <<< "$rules" || return 1
+}
+
+initialize_nft_safe() (
+    local confirm dir committed=0
     echo "[WARN] Emergency Initialize will reset the firewall to a clean single-table config:"
     echo "[WARN]   Config: $NFT_CONF"
     echo "[WARN]   Table:  $MGR_FAMILY $MGR_TABLE"
@@ -863,24 +1366,33 @@ initialize_nft_safe() {
         return
     fi
 
-    backup_active_ruleset
-    backup_persistent_files
-    reset_port_files_to_safe_defaults
-
-    tmp="$(mktemp)"
-    build_unified_config "$tmp" "full_flush"
-
-    if apply_config_file "$tmp" "Emergency initialize" "1"; then
-        rm -f "$tmp"
-        echo "[OK] Safe baseline is active: TCP 22,80,443 only; UDP empty."
-        return 0
-    fi
-
-    rm -f "$tmp"
-    return 1
-}
+    umask 077
+    dir="$(mktemp -d "$BACKUP_DIR/initialize.XXXXXX")" || return 1
+    snapshot_file "$TCP_FILE" "$dir/tcp.list" || return 1
+    snapshot_file "$UDP_FILE" "$dir/udp.list" || return 1
+    finish_initialize() {
+        local rc="$?"
+        trap - EXIT HUP INT TERM
+        if [ "$committed" = 0 ]; then
+            restore_file "$dir/tcp.list" "$TCP_FILE" || echo "[ERROR] TCP list restore failed: $dir" >&2
+            restore_file "$dir/udp.list" "$UDP_FILE" || echo "[ERROR] UDP list restore failed: $dir" >&2
+            [ "$rc" -ne 0 ] || rc=1
+        fi
+        exit "$rc"
+    }
+    trap finish_initialize EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    reset_port_files_to_safe_defaults || return 1
+    build_unified_config "$dir/generated.nft" full_flush || return 1
+    apply_config_file "$dir/generated.nft" "Emergency initialize" 1 || return 1
+    committed=1
+    echo "[OK] Safe baseline is active: TCP 22,80,443 only; UDP empty."
+)
 
 reset_saved_ports() {
+    local confirm
     echo "[WARN] This resets saved port lists only:"
     echo "TCP: 22,80,443"
     echo "UDP: empty"
@@ -899,6 +1411,7 @@ reset_saved_ports() {
 }
 
 show_nftables_active_status() {
+    local active_status enabled_status
     if has_cmd systemctl; then
         active_status="$(systemctl is-active nftables 2>/dev/null || true)"
         enabled_status="$(systemctl is-enabled nftables 2>/dev/null || true)"
@@ -931,7 +1444,7 @@ show_ports() {
     echo ""
 
     echo "=== Active unified table ==="
-    nft list table "$MGR_FAMILY" "$MGR_TABLE" 2>/dev/null || echo "No active target table found: $MGR_FAMILY $MGR_TABLE"
+    nft_cmd list table "$MGR_FAMILY" "$MGR_TABLE" 2>/dev/null || echo "No active target table found: $MGR_FAMILY $MGR_TABLE"
     echo ""
 
     echo "=== Foreign active tables ==="
@@ -939,7 +1452,7 @@ show_ports() {
     echo ""
 
     echo "=== Global dport/log/nat rules for reference only ==="
-    nft list ruleset 2>/dev/null | grep -E 'dport|log prefix|counter drop|dnat|nftfw|nft-new' || echo "No active matching rules found"
+    nft_cmd list ruleset 2>/dev/null | grep -E 'dport|log prefix|counter drop|dnat|nftfw|nft-new' || echo "No active matching rules found"
     echo ""
 
     echo "=== Current persistent config path ==="
@@ -947,6 +1460,7 @@ show_ports() {
 }
 
 show_generated_config() {
+    local tmp
     tmp="$(mktemp)"
     build_unified_config "$tmp" "table_only"
     echo "=== Generated normal Apply config preview ==="
@@ -955,9 +1469,10 @@ show_generated_config() {
 }
 
 extract_active_accept_ports() {
+    local proto
     proto="$1"
 
-    nft list ruleset 2>/dev/null \
+    nft_cmd list ruleset 2>/dev/null \
         | grep -E "[[:space:]]$proto dport .* accept" \
         | sed -E "s/.*$proto dport[[:space:]]+//" \
         | sed -E 's/[[:space:]]+(counter|accept|log|comment|ct|meta|ip|ip6|iif|oif).*$//' \
@@ -973,6 +1488,7 @@ extract_active_accept_ports() {
 }
 
 import_active_accept_ports() {
+    local active_tcp active_udp changed current_tcp current_udp merged_tcp merged_udp
     active_tcp="$(extract_active_accept_ports tcp | paste -sd, -)"
     active_udp="$(extract_active_accept_ports udp | paste -sd, -)"
 
@@ -1007,6 +1523,7 @@ import_active_accept_ports() {
 }
 
 add_ports() {
+    local proto file label input add_csv current_csv new_csv
     read -r -p "tcp or udp? (t/u): " proto
 
     case "$proto" in
@@ -1045,24 +1562,11 @@ add_ports() {
         new_csv="$add_csv"
     fi
 
-    write_csv_file "$file" "$new_csv"
-
-    echo "[OK] saved $label ports:"
-    cat "$file"
-
-    read -r -p "Apply now? This rewrites $NFT_CONF and reloads only the managed nft table. (y/n): " yn
-
-    case "$yn" in
-        y|Y)
-            apply_changes
-            ;;
-        *)
-            echo "[INFO] saved but not applied yet"
-            ;;
-    esac
+    save_ports_with_prompt "$file" "$new_csv" "$label"
 }
 
 remove_ports() {
+    local proto file label input remove_csv current_csv new_csv confirm
     read -r -p "tcp or udp? (t/u): " proto
 
     case "$proto" in
@@ -1111,21 +1615,7 @@ remove_ports() {
     fi
 
     new_csv="$(csv_subtract "$current_csv" "$remove_csv")"
-    write_csv_file "$file" "$new_csv"
-
-    echo "[OK] saved $label ports after range-aware removal:"
-    cat "$file" 2>/dev/null || true
-
-    read -r -p "Apply now? This rewrites $NFT_CONF and reloads only the managed nft table. (y/n): " yn
-
-    case "$yn" in
-        y|Y)
-            apply_changes
-            ;;
-        *)
-            echo "[INFO] saved but not applied yet"
-            ;;
-    esac
+    save_ports_with_prompt "$file" "$new_csv" "$label"
 }
 
 configure_nftables_boot() {
@@ -1168,7 +1658,7 @@ Main behavior in this version:
   2. Manages one nft table:
        $MGR_FAMILY $MGR_TABLE
   3. Normal Apply does NOT use global flush ruleset.
-     It deletes only this script's managed table in the running ruleset, then reloads it.
+     It replaces only this script's managed table in a single nft transaction.
      Foreign tables created by Docker, iptables-nft, sing-box NAT, DNAT, etc. are preserved.
   4. Emergency Initialize still uses:
        flush ruleset
@@ -1176,12 +1666,7 @@ Main behavior in this version:
   5. Input chain default is drop, with explicit allow rules for saved TCP/UDP ports.
   6. Forward is drop by default, with Docker bridge forwarding compatibility. Output is accept.
   7. Emergency Initialize resets to TCP 22,80,443 and empty UDP.
-
-Why this is different from the old own-table script:
-  The old version used a separate manager table with priority 20. Its accept rules
-  could fail to override drops in another base chain. This version writes the
-  managed main table, so its allow/drop decisions are authoritative inside that
-  table, while Normal Apply still preserves foreign nftables tables.
+  8. Menu 15 migrates SSH from TCP 22 to 26 and enables Fail2ban transactionally.
 
 Range-aware removal:
   Removing 1002 from 1000-1005 produces 1000-1001,1003-1005.
@@ -1200,7 +1685,7 @@ Important caution:
   that same table unless you want this script to own them. Backups are saved under:
     $BACKUP_DIR
 
-Docker compatibility in this build:
+  Docker compatibility in this build:
   RESTART_DOCKER_AFTER_NFT=$RESTART_DOCKER_AFTER_NFT
   Normal Apply should not disturb Docker NAT chains. Default auto means: after
   Emergency Initialize only, restart docker.service when Docker is already active,
@@ -1209,9 +1694,10 @@ EOF_HELP
 }
 
 menu() {
+    local c
     while true; do
         echo ""
-        echo "===== NFT FIREWALL MANAGER UNIFIED MAIN TABLE ($SCRIPT_NAME) ====="
+        echo "===== NFT FIREWALL MANAGER v$VERSION ($SCRIPT_NAME) ====="
         show_nftables_active_status
         echo "1) Show saved ports, active table, and foreign table reference"
         echo "2) Add port(s)"
@@ -1227,6 +1713,7 @@ menu() {
         echo "12) Preview generated config"
         echo "13) Help"
         echo "14) Exit"
+        echo "15) Migrate SSH 22 -> 26 and enable Fail2ban"
         echo "======================================================="
         read -r -p "Select: " c
 
@@ -1244,7 +1731,7 @@ menu() {
                 apply_changes
                 ;;
             5)
-                nft list ruleset 2>/dev/null || echo "[INFO] No active nft ruleset found, or nft command failed."
+                nft_cmd list ruleset 2>/dev/null || echo "[INFO] No active nft ruleset found, or nft command failed."
                 ;;
             6)
                 import_active_accept_ports
@@ -1273,6 +1760,9 @@ menu() {
             14)
                 exit 0
                 ;;
+            15)
+                migrate_ssh_to_new_port
+                ;;
             *)
                 echo "invalid"
                 ;;
@@ -1289,6 +1779,7 @@ Usage:
   bash $SCRIPT_PATH --show
   bash $SCRIPT_PATH --preview
   bash $SCRIPT_PATH --help
+  bash $SCRIPT_PATH --version
 
 Options:
   --apply       Build $NFT_CONF from saved port lists and reload only the managed table.
@@ -1296,14 +1787,22 @@ Options:
   --show        Show saved ports and active table/reference rules.
   --preview     Print the normal Apply config without applying it.
   --help        Show detailed help.
+  --version     Show manager version.
 
 Environment shortcuts:
   SKIP_FOREIGN_TABLE_CONFIRM=1  Do not ask when foreign active nft tables exist.
   AUTO_CONFIGURE_LOG_LIMIT=1    Configure journal/logrotate limits during Apply.
+  SSHD_CONFIG=/etc/ssh/sshd_config  Override SSH daemon configuration path.
+  FAIL2BAN_BANTIME=1h FAIL2BAN_FINDTIME=10m FAIL2BAN_MAXRETRY=5
+                                Override migration jail defaults.
 EOF_USAGE
 }
 
 main() {
+    if [ "${1:-}" = "--version" ]; then
+        echo "$SCRIPT_NAME v$VERSION"
+        return 0
+    fi
     need_root
     ensure_nft
     validate_manager_target
@@ -1339,7 +1838,6 @@ main() {
     esac
 }
 
-if [ "${NFTFW_MANAGER_TESTING:-0}" != "1" ]; then
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     main "$@"
 fi
-

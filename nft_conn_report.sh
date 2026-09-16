@@ -2,6 +2,8 @@
 
 set -e
 
+VERSION="2.1.0"
+
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 
 # Report/output timezone. Asia/Shanghai and Asia/Singapore are both UTC+8.
@@ -52,6 +54,7 @@ Usage:
   bash "$SCRIPT_PATH" custom
   bash "$SCRIPT_PATH" status
   bash "$SCRIPT_PATH" raw
+  bash "$SCRIPT_PATH" --version
 
 Optional environment variables:
   LOG_PREFIX='nft-new:' bash "$SCRIPT_PATH" daily
@@ -680,7 +683,7 @@ custom_report() {
     run_report "CUSTOM NFT CONNECTION REPORT" "$start" "$end"
 }
 
-print_recent_logs_utc8() {
+print_recent_logs_localized() {
     journalctl -k -o short-unix --no-pager 2>/dev/null \
         | grep -F "$LOG_PREFIX" \
         | tail -n 10 \
@@ -700,7 +703,7 @@ raw_logs_tail() {
     line
     echo "RAW NFT LOGS TAIL, CONVERTED TO ${REPORT_TZ_LABEL}"
     line
-    print_recent_logs_utc8 || true
+    print_recent_logs_localized || true
 }
 
 check_status() {
@@ -725,13 +728,13 @@ check_status() {
 
     echo ""
     echo "[recent logs converted to ${REPORT_TZ_LABEL}]"
-    print_recent_logs_utc8 || true
+    print_recent_logs_localized || true
 }
 
 menu() {
     while true; do
         echo ""
-        echo "===== NFT CONNECTION REPORT TOP${TOP_N} ${REPORT_TZ_LABEL} V2 ====="
+        echo "===== NFT CONNECTION REPORT TOP${TOP_N} ${REPORT_TZ_LABEL} v$VERSION ====="
         echo "1) Daily report"
         echo "2) Weekly report"
         echo "3) Custom date range"
@@ -779,6 +782,11 @@ menu() {
         esac
     done
 }
+
+if [ "${1:-}" = "--version" ]; then
+    echo "$(basename "$SCRIPT_PATH") v$VERSION"
+    exit 0
+fi
 
 need_tools_check
 
