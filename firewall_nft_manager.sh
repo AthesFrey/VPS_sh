@@ -8,13 +8,13 @@
 # - Normal Apply writes /etc/nftables.conf and reloads nftables directly with nft -f.
 # - Normal Apply does NOT use `flush ruleset`; it replaces only the managed table.
 # - Forward chain keeps policy drop but allows Docker published DNAT and container outbound traffic.
-# - Emergency Initialize still uses `flush ruleset` to recover to a clean baseline.
+# - Emergency Initialize also replaces only the managed table.
 # - Port lists are stored in /etc/nft_ports_tcp.list and /etc/nft_ports_udp.list.
-# - Emergency Initialize resets TCP to 22,80,443 and UDP to empty.
+# - Baselines use the detected SSH listener (22 or 26), plus 80/443; UDP is empty.
 
 set -e
 
-VERSION="2.1.0"
+VERSION="3.0.0"
 
 SCRIPT_PATH="${0:-firewall_nft_manager.sh}"
 SCRIPT_NAME="${SCRIPT_PATH##*/}"
@@ -27,9 +27,7 @@ TCP_FILE="${TCP_FILE:-/etc/nft_ports_tcp.list}"
 UDP_FILE="${UDP_FILE:-/etc/nft_ports_udp.list}"
 NFT_CONF="${NFT_CONF:-/etc/nftables.conf}"
 
-# This version intentionally supports only one nft family/table by default.
-# Keeping these configurable is mostly for advanced users, but validation below
-# restricts them to the safe unified target unless ALLOW_CUSTOM_TARGET=1.
+# Generated rules require the inet family (both IPv4 and IPv6).
 MGR_FAMILY="${MGR_FAMILY:-inet}"
 MGR_TABLE="${MGR_TABLE:-filter}"
 ALLOW_CUSTOM_TARGET="${ALLOW_CUSTOM_TARGET:-0}"
@@ -39,6 +37,7 @@ JOURNAL_LIMIT="${JOURNAL_LIMIT:-100M}"
 JOURNAL_DROPIN_DIR="${JOURNAL_DROPIN_DIR:-/etc/systemd/journald.conf.d}"
 JOURNAL_DROPIN_FILE="${JOURNAL_DROPIN_FILE:-$JOURNAL_DROPIN_DIR/99-nft-log-size-limit.conf}"
 LOGROTATE_FILE="${LOGROTATE_FILE:-/etc/logrotate.d/nft-kernel-logs}"
+LOGROTATE_MAIN_CONF="${LOGROTATE_MAIN_CONF:-/etc/logrotate.conf}"
 
 SSH_OLD_PORT=22
 SSH_NEW_PORT=26
@@ -53,22 +52,8 @@ FAIL2BAN_MAXRETRY="${FAIL2BAN_MAXRETRY:-5}"
 
 NFT_BIN=""
 
-# Docker compatibility: Emergency Initialize uses `flush ruleset`.
-# That can remove Docker's iptables-nft/NAT chains.
-# auto = after Emergency Initialize only, restart docker.service when it is already active.
-# Set to 0/off/no/false to disable, or 1/on/yes/true to force when docker exists.
-RESTART_DOCKER_AFTER_NFT="${RESTART_DOCKER_AFTER_NFT:-auto}"
-
-# Normal Apply replaces only the managed nft table and preserves foreign tables.
-# Emergency Initialize uses full `flush ruleset` and may remove foreign tables.
-# Set SKIP_FOREIGN_TABLE_CONFIRM=1 only if you know Emergency Initialize should proceed.
-SKIP_FOREIGN_TABLE_CONFIRM="${SKIP_FOREIGN_TABLE_CONFIRM:-0}"
-
 # Log storage limits are not changed during Apply by default.
 AUTO_CONFIGURE_LOG_LIMIT="${AUTO_CONFIGURE_LOG_LIMIT:-0}"
-
-# Safety default for generated input chain. Keep this enabled for a firewall.
-INPUT_POLICY_DROP="${INPUT_POLICY_DROP:-1}"
 
 has_cmd() {
     command -v "$1" >/dev/null 2>&1
@@ -129,46 +114,6 @@ ensure_systemctl() {
     fi
 }
 
-docker_service_active() {
-    has_cmd systemctl && systemctl is-active --quiet docker 2>/dev/null
-}
-
-docker_unit_exists() {
-    has_cmd systemctl && systemctl list-unit-files docker.service >/dev/null 2>&1
-}
-
-maybe_restart_docker_after_nft() {
-    local mode
-    mode="$RESTART_DOCKER_AFTER_NFT"
-
-    case "$mode" in
-        0|no|NO|false|FALSE|off|OFF)
-            return 0
-            ;;
-        auto|AUTO|"")
-            if ! docker_service_active; then
-                return 0
-            fi
-            ;;
-        1|yes|YES|true|TRUE|on|ON)
-            if ! docker_unit_exists; then
-                return 0
-            fi
-            ;;
-        *)
-            echo "[WARN] Unknown RESTART_DOCKER_AFTER_NFT=$mode; skipping Docker restart."
-            return 0
-            ;;
-    esac
-
-    echo "[INFO] Restarting docker.service to rebuild Docker NAT/DOCKER chains after nftables reload..."
-    if systemctl restart docker; then
-        echo "[OK] docker.service restarted."
-    else
-        echo "[WARN] docker.service restart failed. If Docker port publishing fails, run: systemctl restart docker"
-    fi
-}
-
 validate_identifier() {
     local name value
     name="$1"
@@ -190,13 +135,10 @@ validate_manager_target() {
         inet)
             ;;
         *)
-            echo "[ERROR] This unified version supports only MGR_FAMILY=inet by default."
+            echo "[ERROR] This version requires MGR_FAMILY=inet."
             echo "[ERROR] Current MGR_FAMILY: $MGR_FAMILY"
             echo "[ERROR] Reason: the generated config contains both IPv4 and IPv6 rules in one table."
-            echo "[ERROR] Use MGR_FAMILY=inet, or set ALLOW_CUSTOM_TARGET=1 only after reviewing the generated nft config."
-            if [ "$ALLOW_CUSTOM_TARGET" != "1" ]; then
-                exit 1
-            fi
+            return 1
             ;;
     esac
 
@@ -209,27 +151,15 @@ validate_manager_target() {
 }
 
 init_files() {
-    touch "$TCP_FILE" "$UDP_FILE"
-
+    local ssh_port
     if [ ! -s "$TCP_FILE" ]; then
-        printf "22\n80\n443\n" > "$TCP_FILE"
+        ssh_port="$(detect_baseline_ssh_port)" || return 1
+        write_csv_file "$TCP_FILE" "$ssh_port,80,443" || return 1
+        echo "[INFO] Initialized TCP baseline: $ssh_port,80,443"
     fi
-}
-
-backup_file() {
-    local src name
-    src="$1"
-    name="$2"
-
-    if [ -f "$src" ]; then
-        cp "$src" "$BACKUP_DIR/$name.$(date +%F-%H%M%S)" || true
+    if [ ! -e "$UDP_FILE" ]; then
+        write_csv_file "$UDP_FILE" "" || return 1
     fi
-}
-
-backup_persistent_files() {
-    backup_file "$NFT_CONF" "nftables.conf"
-    backup_file "$TCP_FILE" "nft_ports_tcp.list"
-    backup_file "$UDP_FILE" "nft_ports_udp.list"
 }
 
 nft_escape_string() {
@@ -311,50 +241,27 @@ item_end() {
     esac
 }
 
-csv_canonicalize() {
-    local csv tmp_items tmp_sorted OLDIFS item
-    csv="$1"
-    tmp_items="$(mktemp)"
-    tmp_sorted="$(mktemp)"
-
-    csv="$(normalize_text "$csv")"
-
-    if [ -z "$csv" ]; then
-        rm -f "$tmp_items" "$tmp_sorted"
-        echo ""
-        return
-    fi
-
-    OLDIFS="$IFS"
-    IFS=','
-
-    for item in $csv; do
-        IFS="$OLDIFS"
-
-        [ -n "$item" ] || {
-            IFS=','
-            continue
-        }
-
+csv_canonicalize() (
+    local csv="$1" dir item
+    local -a items
+    dir="$(mktemp -d)" || return 1
+    trap 'rm -rf -- "$dir"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    csv="$(normalize_text "$csv")" || return 1
+    : > "$dir/items" || return 1
+    IFS=',' read -r -a items <<< "$csv"
+    # Quoted array iteration prevents a wildcard from importing local filenames.
+    for item in "${items[@]}"; do
+        [ -n "$item" ] || continue
         if valid_item "$item"; then
-            printf '%s %s\n' "$(item_start "$item")" "$(item_end "$item")" >> "$tmp_items"
+            printf '%s %s\n' "$(item_start "$item")" "$(item_end "$item")" >> "$dir/items" || return 1
         else
             echo "[WARN] ignored invalid port item: $item" >&2
         fi
-
-        IFS=','
     done
-
-    IFS="$OLDIFS"
-
-    if [ ! -s "$tmp_items" ]; then
-        rm -f "$tmp_items" "$tmp_sorted"
-        echo ""
-        return
-    fi
-
-    sort -n -k1,1 -k2,2 "$tmp_items" > "$tmp_sorted"
-
+    sort -n -k1,1 -k2,2 "$dir/items" > "$dir/sorted" || return 1
     awk '
         function emit(s, e) {
             if (s == "") {
@@ -395,13 +302,12 @@ csv_canonicalize() {
             }
             print result
         }
-    ' "$tmp_sorted"
+    ' "$dir/sorted"
 
-    rm -f "$tmp_items" "$tmp_sorted"
-}
+)
 
 csv_from_file() {
-    local file
+    local file text
     file="$1"
 
     if [ ! -s "$file" ]; then
@@ -409,7 +315,8 @@ csv_from_file() {
         return
     fi
 
-    csv_canonicalize "$(cat "$file")"
+    text="$(cat -- "$file")" || return 1
+    csv_canonicalize "$text"
 }
 
 csv_from_text() {
@@ -419,16 +326,20 @@ csv_from_text() {
 }
 
 write_csv_file() {
-    local file csv
+    local file csv tmp rc=0
     file="$1"
     csv="$2"
 
     csv="$(csv_canonicalize "$csv")" || return 1
-    : > "$file" || return 1
-
-    [ -n "$csv" ] || return 0
-
-    printf '%s\n' "$csv" | tr ',' '\n' > "$file"
+    tmp="$(mktemp)" || return 1
+    if [ -n "$csv" ]; then
+        printf '%s\n' "$csv" | tr ',' '\n' > "$tmp" || rc=1
+    fi
+    if [ "$rc" = 0 ]; then
+        atomic_copy "$tmp" "$file" || rc=1
+    fi
+    rm -f -- "$tmp"
+    return "$rc"
 }
 
 nft_set_from_csv() {
@@ -442,7 +353,7 @@ csv_contains_port() {
     csv="$1"
     port="$2"
 
-    csv="$(csv_canonicalize "$csv")"
+    csv="$(csv_canonicalize "$csv")" || return 1
     [ -n "$csv" ] || return 1
 
     OLDIFS="$IFS"
@@ -465,8 +376,8 @@ csv_contains_port() {
 
 csv_subtract() {
     local current_csv remove_csv
-    current_csv="$(csv_canonicalize "$1")"
-    remove_csv="$(csv_canonicalize "$2")"
+    current_csv="$(csv_canonicalize "$1")" || return 1
+    remove_csv="$(csv_canonicalize "$2")" || return 1
 
     if [ -z "$current_csv" ]; then
         echo ""
@@ -561,40 +472,83 @@ csv_subtract() {
     '
 }
 
-configure_journal_limit() {
+configure_journal_limit() (
+    local dir committed=0 restart_attempted=0
+    ensure_systemctl || return 1
+    if ! has_cmd journalctl; then
+        echo "[ERROR] journalctl not found; log limits were not changed." >&2
+        return 1
+    fi
+    if [[ ! "$JOURNAL_LIMIT" =~ ^[1-9][0-9]*[KMG]?$ ]]; then
+        echo "[ERROR] JOURNAL_LIMIT must be positive bytes or a size such as 100M (K/M/G)." >&2
+        return 1
+    fi
+    umask 077
+    dir="$(mktemp -d "$BACKUP_DIR/logs.XXXXXX")" || return 1
+    snapshot_file "$JOURNAL_DROPIN_FILE" "$dir/journal.conf" || return 1
+    snapshot_file "$LOGROTATE_FILE" "$dir/logrotate.conf" || return 1
+    # Invoked by the EXIT trap.
+    # shellcheck disable=SC2329
+    finish_log_config() {
+        local rc="$?" failed=0
+        trap - EXIT HUP INT TERM
+        if [ "$committed" = 0 ]; then
+            restore_file "$dir/journal.conf" "$JOURNAL_DROPIN_FILE" || failed=1
+            restore_file "$dir/logrotate.conf" "$LOGROTATE_FILE" || failed=1
+            if [ "$restart_attempted" = 1 ]; then
+                systemctl restart systemd-journald || failed=1
+            fi
+            echo "[ERROR] Log limit setup failed; previous configuration restored if possible. Backups: $dir" >&2
+            [ "$failed" = 0 ] || echo "[ERROR] Log configuration rollback incomplete." >&2
+            [ "$rc" -ne 0 ] || rc=1
+        fi
+        exit "$rc"
+    }
+    trap finish_log_config EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     echo "[+] Configuring journald size limit: $JOURNAL_LIMIT"
-
-    mkdir -p "$JOURNAL_DROPIN_DIR"
-
-    cat > "$JOURNAL_DROPIN_FILE" <<EOF_JOURNAL
+    mkdir -p "$(dirname "$JOURNAL_DROPIN_FILE")" || return 1
+    cat > "$dir/journal.new" <<EOF_JOURNAL || return 1
 [Journal]
 SystemMaxUse=$JOURNAL_LIMIT
 RuntimeMaxUse=$JOURNAL_LIMIT
 SystemMaxFileSize=$JOURNAL_LIMIT
 RuntimeMaxFileSize=$JOURNAL_LIMIT
 EOF_JOURNAL
-
-    if has_cmd systemctl; then
-        systemctl restart systemd-journald 2>/dev/null || true
+    atomic_copy "$dir/journal.new" "$JOURNAL_DROPIN_FILE" || return 1
+    configure_logrotate_limit "$dir/logrotate.new" || return 1
+    restart_attempted=1
+    if ! systemctl restart systemd-journald; then
+        echo "[ERROR] journald restart failed." >&2
+        return 1
     fi
-
-    if has_cmd journalctl; then
-        journalctl --vacuum-size="$JOURNAL_LIMIT" >/dev/null 2>&1 || true
+    if ! journalctl --rotate || ! journalctl --vacuum-size="$JOURNAL_LIMIT"; then
+        echo "[ERROR] Journal rotation/cleanup failed; already removed archives cannot be restored." >&2
+        return 1
     fi
-
-    configure_logrotate_limit
-
+    committed=1
     echo "[OK] Log storage limit configured."
-}
+)
 
 configure_logrotate_limit() {
-    if [ ! -d /etc/logrotate.d ]; then
-        return
+    local tmp="$1" size="${JOURNAL_LIMIT/K/k}" logrotate_bin validation_conf
+    if [ ! -d "$(dirname "$LOGROTATE_FILE")" ]; then
+        echo "[INFO] logrotate directory is absent; configuring journald only."
+        return 0
     fi
-
-    cat > "$LOGROTATE_FILE" <<EOF_LOGROTATE
+    logrotate_bin="$(command -v logrotate || true)"
+    if [ -z "$logrotate_bin" ] && [ -x /usr/sbin/logrotate ]; then
+        logrotate_bin=/usr/sbin/logrotate
+    fi
+    if [ -z "$logrotate_bin" ]; then
+        echo "[INFO] logrotate is absent; configuring journald only."
+        return 0
+    fi
+    cat > "$tmp" <<EOF_LOGROTATE || return 1
 /var/log/kern.log /var/log/syslog /var/log/messages {
-    size $JOURNAL_LIMIT
+    size $size
     rotate 1
     missingok
     notifempty
@@ -603,6 +557,18 @@ configure_logrotate_limit() {
     copytruncate
 }
 EOF_LOGROTATE
+    atomic_copy "$tmp" "$LOGROTATE_FILE" || return 1
+    validation_conf="$LOGROTATE_FILE"
+    if [ -f "$LOGROTATE_MAIN_CONF" ]; then
+        validation_conf="$LOGROTATE_MAIN_CONF"
+    fi
+    # --debug performs no rotations or state writes. Check the entire config to
+    # catch duplicate syslog/kern.log entries owned by an existing rsyslog rule.
+    if ! "$logrotate_bin" --debug --state /dev/null "$validation_conf" > "$tmp.check" 2>&1; then
+        echo "[ERROR] logrotate validation failed (including possible duplicate log entries)." >&2
+        cat "$tmp.check" >&2
+        return 1
+    fi
 }
 
 foreign_tables() {
@@ -620,51 +586,18 @@ foreign_tables() {
         '
 }
 
-show_foreign_tables_warning() {
-    local foreign
-    foreign="$(foreign_tables || true)"
-    if [ -n "$foreign" ]; then
-        echo "[WARN] Active nftables contains tables outside $MGR_FAMILY $MGR_TABLE:"
-        printf '%s\n' "$foreign"
-        echo "[WARN] Emergency Initialize uses 'flush ruleset'."
-        echo "[WARN] It will remove those active foreign tables, including iptables-nft tables."
-        return 0
-    fi
-    return 1
-}
-
-confirm_if_foreign_tables_exist() {
-    local confirm
-    if [ "$SKIP_FOREIGN_TABLE_CONFIRM" = "1" ]; then
-        return 0
-    fi
-
-    if show_foreign_tables_warning; then
-        echo "[WARN] Continue only if you want one clean nftables ruleset."
-        read -r -p "Type YES to continue: " confirm
-        if [ "$confirm" != "YES" ]; then
-            echo "[INFO] cancelled"
-            return 1
-        fi
-    fi
-
-    return 0
-}
-
 write_unified_nft_conf() {
-    local out mode tcp_ports udp_ports tcp_set udp_set log_prefix_escaped input_policy
+    local out tcp_ports udp_ports tcp_set udp_set log_prefix_escaped
     out="$1"
-    mode="${2:-table_only}"
-    tcp_ports="$(csv_from_file "$TCP_FILE")" || return 1
+    if [ "$#" -ge 2 ]; then
+        tcp_ports="$2"
+    else
+        tcp_ports="$(csv_from_file "$TCP_FILE")" || return 1
+    fi
     udp_ports="$(csv_from_file "$UDP_FILE")" || return 1
     tcp_set="$(nft_set_from_csv "$tcp_ports")"
     udp_set="$(nft_set_from_csv "$udp_ports")"
     log_prefix_escaped="$(nft_escape_string "$LOG_PREFIX_NFT")"
-
-    input_policy="accept"
-    if [ "$INPUT_POLICY_DROP" = "1" ]; then
-        input_policy="drop"
-    fi
 
     cat > "$out" <<EOF_NFT || return 1
 #!$NFT_BIN -f
@@ -674,36 +607,18 @@ write_unified_nft_conf() {
 # Managed table: $MGR_FAMILY $MGR_TABLE
 EOF_NFT
 
-    case "$mode" in
-        full_flush)
-            cat >> "$out" <<EOF_NFT || return 1
-# Mode: Emergency Initialize. This intentionally flushes the full ruleset.
-# It removes foreign/iptables-nft generated tables, including Docker NAT chains.
-
-flush ruleset
-
-EOF_NFT
-            ;;
-        table_only|"")
-            cat >> "$out" <<EOF_NFT || return 1
-# Mode: Normal Apply. This preserves foreign tables.
-# This file intentionally does not contain global 'flush ruleset'.
+    cat >> "$out" <<EOF_NFT || return 1
+# Apply and initialization both preserve foreign tables.
 # Add is idempotent. Delete and recreate happen in the same nft transaction.
 add table $MGR_FAMILY $MGR_TABLE
 delete table $MGR_FAMILY $MGR_TABLE
 
 EOF_NFT
-            ;;
-        *)
-            echo "[ERROR] Invalid nft config mode: $mode" >&2
-            return 1
-            ;;
-    esac
 
     cat >> "$out" <<EOF_NFT || return 1
 table $MGR_FAMILY $MGR_TABLE {
     chain input {
-        type filter hook input priority 0; policy $input_policy;
+        type filter hook input priority 0; policy drop;
 
         iif "lo" accept comment "nftfw: loopback"
         ct state established,related accept comment "nftfw: established related"
@@ -723,7 +638,7 @@ EOF_NFT
     cat >> "$out" <<EOF_NFT || return 1
 
         ip protocol icmp accept comment "nftfw: icmp"
-        ip6 nexthdr icmpv6 accept comment "nftfw: icmpv6"
+        meta l4proto ipv6-icmp accept comment "nftfw: icmpv6"
 
         ct state new log prefix "$log_prefix_escaped" level info comment "nftfw: log unmanaged new"
         counter drop comment "nftfw: final input drop"
@@ -751,13 +666,6 @@ EOF_NFT
     }
 }
 EOF_NFT
-}
-
-build_unified_config() {
-    local tmp mode
-    tmp="$1"
-    mode="${2:-table_only}"
-    write_unified_nft_conf "$tmp" "$mode"
 }
 
 # Snapshots include a marker for absent files, so rollback also removes new files.
@@ -806,7 +714,6 @@ snapshot_firewall() {
     snapshot_file "$NFT_CONF" "$dir/nftables.conf" || return 1
     snapshot_file "$TCP_FILE" "$dir/tcp.list" || return 1
     snapshot_file "$UDP_FILE" "$dir/udp.list" || return 1
-    nft_cmd list ruleset > "$dir/active-ruleset.nft" || return 1
     nft_cmd list tables > "$dir/tables" || return 1
     if awk -v f="$MGR_FAMILY" -v t="$MGR_TABLE" '
         $1 == "table" && $2 == f && $3 == t { found=1 }
@@ -827,39 +734,33 @@ restore_firewall_files() {
 }
 
 restore_firewall_rules() {
-    local dir="$1" full="${2:-0}" restore="$1/restore.nft"
-    if [ "$full" = 1 ]; then
-        printf 'flush ruleset\n' > "$restore" || return 1
-        cat "$dir/active-ruleset.nft" >> "$restore" || return 1
-    else
-        printf 'add table %s %s\ndelete table %s %s\n' \
-            "$MGR_FAMILY" "$MGR_TABLE" "$MGR_FAMILY" "$MGR_TABLE" > "$restore" || return 1
-        if [ -f "$dir/managed.nft" ]; then
-            cat "$dir/managed.nft" >> "$restore" || return 1
-        elif [ ! -f "$dir/managed.nft.missing" ]; then
-            return 1
-        fi
+    local dir="$1" restore="$1/restore.nft"
+    printf 'add table %s %s\ndelete table %s %s\n' \
+        "$MGR_FAMILY" "$MGR_TABLE" "$MGR_FAMILY" "$MGR_TABLE" > "$restore" || return 1
+    if [ -f "$dir/managed.nft" ]; then
+        cat "$dir/managed.nft" >> "$restore" || return 1
+    elif [ ! -f "$dir/managed.nft.missing" ]; then
+        return 1
     fi
     nft_cmd -f "$restore"
 }
 
 apply_config_file() (
-    local config="$1" action_name="$2" full="${3:-0}" dir
+    local config="$1" action_name="$2" dir
     local runtime_dirty=0 committed=0
     umask 077
-    if [ "$full" = 1 ]; then
-        confirm_if_foreign_tables_exist || return 1
-    fi
     dir="$(mktemp -d "$BACKUP_DIR/apply.XXXXXX")" || return 1
     snapshot_firewall "$dir" || return 1
 
+    # Invoked by the EXIT trap.
+    # shellcheck disable=SC2329
     finish_apply() {
         local rc="$?" failed=0
         trap - EXIT HUP INT TERM
         if [ "$committed" = 0 ]; then
             restore_firewall_files "$dir" || failed=1
             if [ "$runtime_dirty" = 1 ]; then
-                restore_firewall_rules "$dir" "$full" || failed=1
+                restore_firewall_rules "$dir" || failed=1
             fi
             if [ "$failed" = 1 ]; then
                 echo "[ERROR] Firewall rollback incomplete. Backups: $dir" >&2
@@ -885,13 +786,10 @@ apply_config_file() (
         return 1
     fi
     if has_cmd systemctl && ! systemctl is-enabled --quiet nftables 2>/dev/null; then
-        systemctl enable nftables >/dev/null 2>&1 || true
+        systemctl enable nftables || echo "[WARN] Rules are active, but enabling nftables at boot failed." >&2
     fi
     if [ "$AUTO_CONFIGURE_LOG_LIMIT" = 1 ]; then
         configure_journal_limit || echo "[WARN] Could not configure log limits." >&2
-    fi
-    if [ "$full" = 1 ]; then
-        maybe_restart_docker_after_nft
     fi
     committed=1
     echo "[OK] $action_name completed. Backups: $dir"
@@ -900,8 +798,8 @@ apply_config_file() (
 apply_changes() {
     local tmp rc=0
     tmp="$(mktemp)" || return 1
-    if build_unified_config "$tmp" table_only; then
-        apply_config_file "$tmp" Apply 0 || rc=$?
+    if write_unified_nft_conf "$tmp"; then
+        apply_config_file "$tmp" Apply || rc=$?
     else
         rc=1
     fi
@@ -917,6 +815,8 @@ save_ports_with_prompt() (
     dir="$(mktemp -d "$BACKUP_DIR/ports.XXXXXX")" || return 1
     snapshot_file "$TCP_FILE" "$dir/tcp.list" || return 1
     snapshot_file "$UDP_FILE" "$dir/udp.list" || return 1
+    # Invoked by the EXIT trap.
+    # shellcheck disable=SC2329
     finish_port_edit() {
         local rc="$?"
         trap - EXIT HUP INT TERM
@@ -942,9 +842,63 @@ save_ports_with_prompt() (
     committed=1
 )
 
+detect_baseline_ssh_port() {
+    local _client_ip _client_port _server_ip session_port extra listeners ports sshd_bin source
+    read -r _client_ip _client_port _server_ip session_port extra <<< "${SSH_CONNECTION:-}" || true
+    if [ -z "$session_port" ]; then
+        read -r _client_ip _client_port session_port extra <<< "${SSH_CLIENT:-}" || true
+    fi
+    case "$session_port" in
+        22|26) ;;
+        *) session_port="" ;;
+    esac
+    [ -z "$extra" ] || session_port=""
+
+    ports=""
+    # A session opened on 22 can survive migration to 26. Prefer current sshd
+    # listeners so the next connection remains possible after initialization.
+    if has_cmd ss && listeners="$(ss -H -ltnp 2>/dev/null)"; then
+        ports="$(awk '/"sshd"|"sshd-session"/ {
+            n=split($4,a,":"); if (a[n] ~ /^[0-9]+$/) print a[n]
+        }' <<< "$listeners" | sort -nu)"
+    fi
+    source="SSH listeners"
+    if [ -z "$ports" ] && [ -n "$session_port" ]; then
+        printf '%s\n' "$session_port"
+        return 0
+    fi
+    if [ -z "$ports" ] && sshd_bin="$(find_sshd_binary)"; then
+        ports="$(effective_sshd_ports "$sshd_bin" 2>/dev/null)" || ports=""
+        source="effective SSH configuration"
+    fi
+    ports="$(awk '$1 == 22 || $1 == 26 { print $1 }' <<< "$ports" | sort -nu)"
+    case "$ports" in
+        22|26)
+            echo "[INFO] Baseline SSH port: $ports ($source)." >&2
+            printf '%s\n' "$ports"
+            ;;
+        $'22\n26')
+            if [ -n "$session_port" ]; then
+                printf '%s\n' "$session_port"
+            else
+                echo "[ERROR] SSH uses both 22 and 26 and the current SSH connection is unknown; baseline unchanged." >&2
+                return 1
+            fi
+            ;;
+        *)
+            echo "[ERROR] Cannot identify SSH port 22 or 26 from listeners, connection, or configuration; baseline unchanged." >&2
+            return 1
+            ;;
+    esac
+}
+
 reset_port_files_to_safe_defaults() {
-    printf "22\n80\n443\n" > "$TCP_FILE" || return 1
-    : > "$UDP_FILE"
+    local ssh_port="${1:-}"
+    if [ -z "$ssh_port" ]; then
+        ssh_port="$(detect_baseline_ssh_port)" || return 1
+    fi
+    write_csv_file "$TCP_FILE" "$ssh_port,80,443" || return 1
+    write_csv_file "$UDP_FILE" ""
 }
 
 detect_ssh_service() {
@@ -1013,10 +967,10 @@ migration_preflight() {
     local sshd_bin="$1" unit="$2" socket args pid enabled
     need_root
     ensure_systemctl || return 1
-    [ -f /etc/debian_version ] && has_cmd apt-get && has_cmd ss || {
+    if [ ! -f /etc/debian_version ] || ! has_cmd apt-get || ! has_cmd ss; then
         echo "[ERROR] Migration requires Debian, apt-get and ss (iproute2)." >&2
         return 1
-    }
+    fi
     [ -n "$NFT_BIN" ] && [ -x "$NFT_BIN" ] && [ -f "$SSHD_CONFIG" ] || return 1
     for socket in ssh.socket sshd.socket; do
         if systemctl is-active --quiet "$socket" 2>/dev/null ||
@@ -1262,6 +1216,8 @@ migrate_ssh_to_new_port() (
     save_service_state "$ssh_unit" "$migration_dir/ssh"
     save_service_state fail2ban.service "$migration_dir/fail2ban"
     save_service_state nftables.service "$migration_dir/nftables"
+    # Invoked by the EXIT trap.
+    # shellcheck disable=SC2329
     finish_migration() {
         local rc="$?"
         trap - EXIT HUP INT TERM
@@ -1332,7 +1288,7 @@ migrate_ssh_to_new_port() (
 
 # A saved list is not proof that the last firewall application completed.
 managed_rules_match() {
-    local rules live expected proto file
+    local rules live proto file
     rules="$(nft_cmd -nn list table "$MGR_FAMILY" "$MGR_TABLE" 2>/dev/null)" || return 1
     for proto in tcp udp; do
         file="$TCP_FILE"
@@ -1342,24 +1298,23 @@ managed_rules_match() {
             | tr -d '{} ')"
         [ "$(csv_from_text "$live")" = "$(csv_from_file "$file")" ] || return 1
     done
-    expected="drop"
-    [ "$INPUT_POLICY_DROP" = 1 ] || expected="accept"
-    grep -Eq "hook input priority (filter|0); policy $expected;" <<< "$rules" || return 1
+    grep -Eq 'hook input priority (filter|0); policy drop;' <<< "$rules" || return 1
     grep -Fq 'comment "nftfw: log unmanaged new"' <<< "$rules" || return 1
     grep -Fq "log prefix \"$(nft_escape_string "$LOG_PREFIX_NFT")\"" <<< "$rules" || return 1
 }
 
 initialize_nft_safe() (
-    local confirm dir committed=0
-    echo "[WARN] Emergency Initialize will reset the firewall to a clean single-table config:"
+    local confirm dir ssh_port committed=0
+    ssh_port="$(detect_baseline_ssh_port)" || return 1
+    echo "[WARN] Emergency Initialize will reset the managed firewall table:"
     echo "[WARN]   Config: $NFT_CONF"
     echo "[WARN]   Table:  $MGR_FAMILY $MGR_TABLE"
-    echo "[WARN]   TCP allowed: 22,80,443"
+    echo "[WARN]   TCP allowed: $ssh_port,80,443"
     echo "[WARN]   UDP allowed: none"
     echo "[WARN]   Forward: drop"
     echo "[WARN]   Output: accept"
-    echo "[WARN] It uses 'flush ruleset' and removes active foreign tables."
-    read -r -p "Type YES to initialize/recover nftables now: " confirm
+    echo "[INFO] Foreign tables, including Docker and Fail2ban, are preserved."
+    read -r -p "Type YES to initialize/recover nftables now: " confirm || return 1
 
     if [ "$confirm" != "YES" ]; then
         echo "[INFO] cancelled"
@@ -1370,6 +1325,8 @@ initialize_nft_safe() (
     dir="$(mktemp -d "$BACKUP_DIR/initialize.XXXXXX")" || return 1
     snapshot_file "$TCP_FILE" "$dir/tcp.list" || return 1
     snapshot_file "$UDP_FILE" "$dir/udp.list" || return 1
+    # Invoked by the EXIT trap.
+    # shellcheck disable=SC2329
     finish_initialize() {
         local rc="$?"
         trap - EXIT HUP INT TERM
@@ -1384,31 +1341,51 @@ initialize_nft_safe() (
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    reset_port_files_to_safe_defaults || return 1
-    build_unified_config "$dir/generated.nft" full_flush || return 1
-    apply_config_file "$dir/generated.nft" "Emergency initialize" 1 || return 1
+    reset_port_files_to_safe_defaults "$ssh_port" || return 1
+    write_unified_nft_conf "$dir/generated.nft" || return 1
+    apply_config_file "$dir/generated.nft" "Emergency initialize" || return 1
     committed=1
-    echo "[OK] Safe baseline is active: TCP 22,80,443 only; UDP empty."
+    echo "[OK] Safe baseline is active: TCP $ssh_port,80,443 only; UDP empty."
 )
 
-reset_saved_ports() {
-    local confirm
+reset_saved_ports() (
+    local confirm ssh_port dir committed=0
+    ssh_port="$(detect_baseline_ssh_port)" || return 1
     echo "[WARN] This resets saved port lists only:"
-    echo "TCP: 22,80,443"
+    echo "TCP: $ssh_port,80,443"
     echo "UDP: empty"
     echo "[WARN] It does not apply/restart nftables until you choose Apply."
-    read -r -p "Type YES to reset saved lists: " confirm
+    read -r -p "Type YES to reset saved lists: " confirm || return 1
 
     if [ "$confirm" != "YES" ]; then
         echo "[INFO] cancelled"
         return
     fi
 
-    backup_persistent_files
-    reset_port_files_to_safe_defaults
-
+    umask 077
+    dir="$(mktemp -d "$BACKUP_DIR/reset.XXXXXX")" || return 1
+    snapshot_file "$TCP_FILE" "$dir/tcp.list" || return 1
+    snapshot_file "$UDP_FILE" "$dir/udp.list" || return 1
+    # Invoked by the EXIT trap.
+    # shellcheck disable=SC2329
+    finish_reset() {
+        local rc="$?"
+        trap - EXIT HUP INT TERM
+        if [ "$committed" = 0 ]; then
+            restore_file "$dir/tcp.list" "$TCP_FILE" || echo "[ERROR] TCP list restore failed: $dir" >&2
+            restore_file "$dir/udp.list" "$UDP_FILE" || echo "[ERROR] UDP list restore failed: $dir" >&2
+            [ "$rc" -ne 0 ] || rc=1
+        fi
+        exit "$rc"
+    }
+    trap finish_reset EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    reset_port_files_to_safe_defaults "$ssh_port" || return 1
+    committed=1
     echo "[OK] saved port lists reset"
-}
+)
 
 show_nftables_active_status() {
     local active_status enabled_status
@@ -1460,67 +1437,154 @@ show_ports() {
 }
 
 show_generated_config() {
-    local tmp
-    tmp="$(mktemp)"
-    build_unified_config "$tmp" "table_only"
-    echo "=== Generated normal Apply config preview ==="
-    cat "$tmp"
-    rm -f "$tmp"
-}
-
-extract_active_accept_ports() {
-    local proto
-    proto="$1"
-
-    nft_cmd list ruleset 2>/dev/null \
-        | grep -E "[[:space:]]$proto dport .* accept" \
-        | sed -E "s/.*$proto dport[[:space:]]+//" \
-        | sed -E 's/[[:space:]]+(counter|accept|log|comment|ct|meta|ip|ip6|iif|oif).*$//' \
-        | tr -d '{} ' \
-        | tr ',' '\n' \
-        | sed '/^$/d' \
-        | while read -r item; do
-            if valid_item "$item"; then
-                echo "$item"
-            fi
-        done \
-        | awk '!seen[$0]++'
-}
-
-import_active_accept_ports() {
-    local active_tcp active_udp changed current_tcp current_udp merged_tcp merged_udp
-    active_tcp="$(extract_active_accept_ports tcp | paste -sd, -)"
-    active_udp="$(extract_active_accept_ports udp | paste -sd, -)"
-
-    changed=0
-
-    if [ -n "$active_tcp" ]; then
-        current_tcp="$(csv_from_file "$TCP_FILE")"
-        merged_tcp="$(csv_from_text "$current_tcp,$active_tcp")"
-        write_csv_file "$TCP_FILE" "$merged_tcp"
-        changed=1
-    fi
-
-    if [ -n "$active_udp" ]; then
-        current_udp="$(csv_from_file "$UDP_FILE")"
-        merged_udp="$(csv_from_text "$current_udp,$active_udp")"
-        write_csv_file "$UDP_FILE" "$merged_udp"
-        changed=1
-    fi
-
-    if [ "$changed" -eq 1 ]; then
-        echo "[OK] Imported simple active accept dport rules into saved lists."
+    local tmp tcp_ports ssh_port rc=0
+    if [ ! -s "$TCP_FILE" ]; then
+        ssh_port="$(detect_baseline_ssh_port)" || return 1
+        tcp_ports="$ssh_port,80,443"
     else
-        echo "[INFO] No simple active accept dport rules found to import."
+        tcp_ports="$(csv_from_file "$TCP_FILE")" || return 1
     fi
-
-    echo ""
-    echo "=== TCP saved list ==="
-    cat "$TCP_FILE" 2>/dev/null || true
-    echo ""
-    echo "=== UDP saved list ==="
-    cat "$UDP_FILE" 2>/dev/null || true
+    tmp="$(mktemp)" || return 1
+    if ! write_unified_nft_conf "$tmp" "$tcp_ports"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    echo "=== Generated normal Apply config preview ==="
+    cat "$tmp" || rc=1
+    rm -f "$tmp"
+    return "$rc"
 }
+
+# Read one numeric JSON snapshot. Port lists cannot express address, interface,
+# family, set, jump-path, or connection-state constraints; never discard them.
+extract_active_accept_ports() {
+    local snapshot="$1"
+    python3 - "$snapshot" "$MGR_FAMILY" "$MGR_TABLE" <<'PY_IMPORT'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        entries = json.load(stream)["nftables"]
+    family, table = sys.argv[2:]
+    tables = [e["table"] for e in entries if "table" in e
+              and (e["table"].get("family"), e["table"].get("name")) == (family, table)]
+    if len(tables) != 1 or tables[0].get("flags"):
+        raise ValueError("requires an active managed table without special flags")
+    chains = [e["chain"] for e in entries if "chain" in e
+              and e["chain"].get("family") == family and e["chain"].get("table") == table]
+    inputs = [c for c in chains if c.get("hook") == "input"]
+    if len(inputs) != 1 or inputs[0].get("name") != "input" or inputs[0].get("type") != "filter":
+        raise ValueError("requires exactly one base input chain named input in the managed inet table")
+    if any(c.get("hook") in ("prerouting", "ingress") for c in chains):
+        raise ValueError("managed ingress/prerouting chains may constrain input traffic")
+
+    def ports(value):
+        if type(value) is int and 1 <= value <= 65535:
+            return [str(value)]
+        if isinstance(value, dict) and set(value) == {"range"}:
+            bounds = value["range"]
+            if (isinstance(bounds, list) and len(bounds) == 2
+                    and all(type(x) is int and 1 <= x <= 65535 for x in bounds)
+                    and bounds[0] <= bounds[1]):
+                return [f"{bounds[0]}-{bounds[1]}"]
+        if isinstance(value, dict) and set(value) == {"set"} and isinstance(value["set"], list):
+            result = []
+            for item in value["set"]:
+                result.extend(ports(item))
+            if result:
+                return result
+        raise ValueError("port expression is not a numeric port/range/anonymous set")
+
+    result = {"tcp": [], "udp": []}
+    blocked = False
+    skipped = 0
+    for entry in entries:
+        rule = entry.get("rule", {})
+        if (rule.get("family"), rule.get("table"), rule.get("chain")) != (family, table, "input"):
+            continue
+        expr = rule.get("expr", [])
+        # This exact invalid-state drop is also emitted by our generated baseline.
+        invalid_drop = len(expr) == 2 and expr[-1] == {"drop": None} and expr[0] in (
+            {"match": {"op": "in", "left": {"ct": {"key": "state"}}, "right": 1}},
+            {"match": {"op": "==", "left": {"ct": {"key": "state"}}, "right": "invalid"}},
+        )
+        if not invalid_drop and any(set(e) - {"match", "counter", "log", "accept", "limit"} for e in expr):
+            blocked = True  # drop/reject/jump/return/mark/map/etc. may restrict a later accept.
+        if not expr or expr[-1] != {"accept": None}:
+            continue
+        matches = [e["match"] for e in expr if set(e) == {"match"}]
+        if (blocked or len(matches) != 1
+                or any(len(e) != 1 or set(e) - {"match", "counter", "log", "accept"} for e in expr)
+                or sum("accept" in e for e in expr) != 1):
+            skipped += 1
+            continue
+        match = matches[0]
+        proto = next((p for p in result if match.get("left") == {"payload": {"protocol": p, "field": "dport"}}), None)
+        if proto is None or match.get("op") != "==":
+            skipped += 1
+            continue
+        try:
+            result[proto].extend(ports(match.get("right")))
+        except ValueError:
+            skipped += 1
+    for proto, items in result.items():
+        for item in items:
+            print(proto, item)
+    if skipped:
+        print(f"[INFO] Skipped {skipped} input accept rule(s) with constraints or unsupported expressions.", file=sys.stderr)
+except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+    print(f"[ERROR] Safe import failed: {error}", file=sys.stderr)
+    sys.exit(1)
+PY_IMPORT
+}
+
+import_active_accept_ports() (
+    local dir current_tcp current_udp merged_tcp merged_udp active_tcp active_udp committed=0
+    if ! has_cmd python3; then
+        echo "[ERROR] Safe JSON import requires python3; saved lists were not changed." >&2
+        return 1
+    fi
+    umask 077
+    dir="$(mktemp -d "$BACKUP_DIR/import.XXXXXX")" || return 1
+    # -nn prevents service-name conversion. Never scrape the full textual ruleset.
+    nft_cmd -j -nn list table "$MGR_FAMILY" "$MGR_TABLE" > "$dir/active.json" || return 1
+    extract_active_accept_ports "$dir/active.json" > "$dir/ports" || return 1
+    active_tcp="$(awk '$1 == "tcp" { print $2 }' "$dir/ports" | paste -sd, -)" || return 1
+    active_udp="$(awk '$1 == "udp" { print $2 }' "$dir/ports" | paste -sd, -)" || return 1
+    current_tcp="$(csv_from_file "$TCP_FILE")" || return 1
+    current_udp="$(csv_from_file "$UDP_FILE")" || return 1
+    merged_tcp="$(csv_from_text "$current_tcp,$active_tcp")" || return 1
+    merged_udp="$(csv_from_text "$current_udp,$active_udp")" || return 1
+    if [ "$merged_tcp" = "$current_tcp" ] && [ "$merged_udp" = "$current_udp" ]; then
+        echo "[INFO] No additional unrestricted input ports to import."
+        return 0
+    fi
+    snapshot_file "$TCP_FILE" "$dir/tcp.list" || return 1
+    snapshot_file "$UDP_FILE" "$dir/udp.list" || return 1
+    # Invoked by the EXIT trap.
+    # shellcheck disable=SC2329
+    finish_import() {
+        local rc="$?"
+        trap - EXIT HUP INT TERM
+        if [ "$committed" = 0 ]; then
+            restore_file "$dir/tcp.list" "$TCP_FILE" || echo "[ERROR] TCP list restore failed: $dir" >&2
+            restore_file "$dir/udp.list" "$UDP_FILE" || echo "[ERROR] UDP list restore failed: $dir" >&2
+            [ "$rc" -ne 0 ] || rc=1
+        fi
+        exit "$rc"
+    }
+    trap finish_import EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    write_csv_file "$TCP_FILE" "$merged_tcp" || return 1
+    write_csv_file "$UDP_FILE" "$merged_udp" || return 1
+    committed=1
+    echo "[OK] Imported unrestricted ports from $MGR_FAMILY $MGR_TABLE input. Saved only; Apply is separate."
+    echo "TCP: ${merged_tcp:-empty}"
+    echo "UDP: ${merged_udp:-empty}"
+)
 
 add_ports() {
     local proto file label input add_csv current_csv new_csv
@@ -1547,17 +1611,17 @@ add_ports() {
     echo "  3556,3666-3669,15000-18369"
     read -r -p "port(s): " input
 
-    add_csv="$(csv_from_text "$input")"
+    add_csv="$(csv_from_text "$input")" || return 1
 
     if [ -z "$add_csv" ]; then
         echo "[ERROR] no valid ports found"
         return
     fi
 
-    current_csv="$(csv_from_file "$file")"
+    current_csv="$(csv_from_file "$file")" || return 1
 
     if [ -n "$current_csv" ]; then
-        new_csv="$(csv_from_text "$current_csv,$add_csv")"
+        new_csv="$(csv_from_text "$current_csv,$add_csv")" || return 1
     else
         new_csv="$add_csv"
     fi
@@ -1566,7 +1630,7 @@ add_ports() {
 }
 
 remove_ports() {
-    local proto file label input remove_csv current_csv new_csv confirm
+    local proto file label input remove_csv current_csv new_csv confirm ssh_port
     read -r -p "tcp or udp? (t/u): " proto
 
     case "$proto" in
@@ -1590,8 +1654,8 @@ remove_ports() {
     echo "  3556,3666-3669,15000-18369"
     read -r -p "port(s) to remove: " input
 
-    remove_csv="$(csv_from_text "$input")"
-    current_csv="$(csv_from_file "$file")"
+    remove_csv="$(csv_from_text "$input")" || return 1
+    current_csv="$(csv_from_file "$file")" || return 1
 
     if [ -z "$remove_csv" ]; then
         echo "[ERROR] no valid remove items"
@@ -1603,8 +1667,12 @@ remove_ports() {
         return
     fi
 
-    if [ "$file" = "$TCP_FILE" ] && csv_contains_port "$remove_csv" 22; then
-        echo "[WARN] You are removing or partially removing TCP 22 from this firewall list."
+    ssh_port="$(detect_baseline_ssh_port 2>/dev/null)" || ssh_port=""
+    if [ "$file" = "$TCP_FILE" ] && {
+        csv_contains_port "$remove_csv" "${ssh_port:-22}" ||
+        { [ -z "$ssh_port" ] && csv_contains_port "$remove_csv" 26; }
+    }; then
+        echo "[WARN] You are removing the SSH port (${ssh_port:-22/26}) from this firewall list."
         echo "[WARN] Make sure another SSH path is already open and tested."
         read -r -p "Type YES to continue: " confirm
 
@@ -1614,7 +1682,7 @@ remove_ports() {
         fi
     fi
 
-    new_csv="$(csv_subtract "$current_csv" "$remove_csv")"
+    new_csv="$(csv_subtract "$current_csv" "$remove_csv")" || return 1
     save_ports_with_prompt "$file" "$new_csv" "$label"
 }
 
@@ -1622,7 +1690,7 @@ configure_nftables_boot() {
     ensure_systemctl || return 1
 
     echo "[+] Enabling nftables service at boot..."
-    systemctl enable nftables
+    systemctl enable nftables || return 1
     echo "[OK] nftables service enabled. It will load: $NFT_CONF"
 }
 
@@ -1652,44 +1720,29 @@ show_help() {
 Usage:
   bash $SCRIPT_PATH
 
-Main behavior in this version:
-  1. Manages one persistent nftables config file:
-       $NFT_CONF
-  2. Manages one nft table:
-       $MGR_FAMILY $MGR_TABLE
-  3. Normal Apply does NOT use global flush ruleset.
-     It replaces only this script's managed table in a single nft transaction.
-     Foreign tables created by Docker, iptables-nft, sing-box NAT, DNAT, etc. are preserved.
-  4. Emergency Initialize still uses:
-       flush ruleset
-     to recover to one clean baseline ruleset.
-  5. Input chain default is drop, with explicit allow rules for saved TCP/UDP ports.
-  6. Forward is drop by default, with Docker bridge forwarding compatibility. Output is accept.
-  7. Emergency Initialize resets to TCP 22,80,443 and empty UDP.
-  8. Menu 15 migrates SSH from TCP 22 to 26 and enables Fail2ban transactionally.
+The manager replaces only table $MGR_FAMILY $MGR_TABLE in one transaction.
+Apply, emergency initialization and persistent reloads preserve foreign tables
+such as Docker and Fail2ban. Input and forward default to drop; output to accept.
+IPv4 Docker bridge forwarding rules remain enabled.
 
-Range-aware removal:
-  Removing 1002 from 1000-1005 produces 1000-1001,1003-1005.
-  Removing 1002-1003 from 1000-1005 produces 1000-1001,1004-1005.
-  Removing a range that includes TCP 22 triggers an SSH warning.
+Baselines (first use, empty TCP list, reset and emergency initialization):
+  TCP: detected SSH port (22 or 26),80,443; UDP: empty on explicit reset.
+  Current sshd listeners take priority over an older SSH session's port.
+  With both listeners, the current connection selects the SSH port.
+  If detection is ambiguous or unavailable, initialization fails without guessing.
 
-Safe baseline:
-  Menu 7 writes the equivalent of:
-    TCP: 22,80,443
-    UDP: empty
-    table inet filter with input drop, forward drop, output accept
+Import (menu 6):
+  Only numeric, unrestricted TCP/UDP destination-port accept rules from the
+  managed inet input base chain can be saved. Address/interface/state constraints,
+  named sets, other families/tables/chains and unsupported rules are skipped.
+  Earlier restrictive rules prevent importing later accepts. Requires python3.
+  Import only saves lists. Apply replaces the entire managed table, including
+  manual rules; manage constrained rules in a separate table.
 
-Important caution:
-  Normal Apply preserves foreign nftables tables, but it still replaces the whole
-  managed table: $MGR_FAMILY $MGR_TABLE. Avoid putting unrelated manual rules in
-  that same table unless you want this script to own them. Backups are saved under:
-    $BACKUP_DIR
-
-  Docker compatibility in this build:
-  RESTART_DOCKER_AFTER_NFT=$RESTART_DOCKER_AFTER_NFT
-  Normal Apply should not disturb Docker NAT chains. Default auto means: after
-  Emergency Initialize only, restart docker.service when Docker is already active,
-  so Docker can recreate its DOCKER/NAT chains after a full flush.
+Range-aware removal supports holes, e.g. 1002 from 1000-1005 -> 1000-1001,1003-1005.
+Removing the detected SSH port prompts for confirmation.
+Menu 15 migrates SSH 22 -> 26 and configures Fail2ban with rollback on failure.
+Backups: $BACKUP_DIR
 EOF_HELP
 }
 
@@ -1704,8 +1757,8 @@ menu() {
         echo "3) Remove port(s), range-aware"
         echo "4) Apply saved ports to unified /etc/nftables.conf"
         echo "5) Show full active nft ruleset"
-        echo "6) Import current active accept dport rules into saved lists"
-        echo "7) Emergency initialize/recover NFT to TCP 22,80,443 only"
+        echo "6) Import unrestricted managed input ports into saved lists"
+        echo "7) Emergency initialize: detected SSH (22/26),80,443; preserve foreign tables"
         echo "8) Reset saved port lists only, no apply"
         echo "9) Configure log size limit only"
         echo "10) Show log size status"
@@ -1715,7 +1768,7 @@ menu() {
         echo "14) Exit"
         echo "15) Migrate SSH 22 -> 26 and enable Fail2ban"
         echo "======================================================="
-        read -r -p "Select: " c
+        read -r -p "Select: " c || return 0
 
         case "$c" in
             1)
@@ -1783,14 +1836,13 @@ Usage:
 
 Options:
   --apply       Build $NFT_CONF from saved port lists and reload only the managed table.
-  --init-safe   Emergency reset to TCP 22,80,443 and empty UDP, then restart/apply nftables.
+  --init-safe   Detect SSH 22/26, reset TCP to SSH/80/443 and UDP to empty, apply managed table.
   --show        Show saved ports and active table/reference rules.
   --preview     Print the normal Apply config without applying it.
   --help        Show detailed help.
   --version     Show manager version.
 
 Environment shortcuts:
-  SKIP_FOREIGN_TABLE_CONFIRM=1  Do not ask when foreign active nft tables exist.
   AUTO_CONFIGURE_LOG_LIMIT=1    Configure journal/logrotate limits during Apply.
   SSHD_CONFIG=/etc/ssh/sshd_config  Override SSH daemon configuration path.
   FAIL2BAN_BANTIME=1h FAIL2BAN_FINDTIME=10m FAIL2BAN_MAXRETRY=5
@@ -1799,42 +1851,38 @@ EOF_USAGE
 }
 
 main() {
-    if [ "${1:-}" = "--version" ]; then
-        echo "$SCRIPT_NAME v$VERSION"
-        return 0
+    # Informational/invalid options must never install packages or initialize files.
+    if [ "$#" -gt 1 ]; then
+        echo "[ERROR] Expected at most one option." >&2
+        return 1
     fi
-    need_root
-    ensure_nft
-    validate_manager_target
-    ensure_dirs
-    init_files
-
     case "${1:-}" in
-        "")
-            menu
-            ;;
-        --apply)
-            apply_changes
-            ;;
-        --init-safe|--initialize|--rescue)
-            initialize_nft_safe
+        --version) echo "$SCRIPT_NAME v$VERSION"; return 0 ;;
+        --help|-h) show_cli_usage; echo ""; show_help; return 0 ;;
+        ""|--apply|--init-safe|--initialize|--rescue|--show|--preview) ;;
+        *) echo "[ERROR] unknown option: $1" >&2; show_cli_usage; return 1 ;;
+    esac
+    validate_manager_target || return 1
+    case "${1:-}" in
+        --preview)
+            NFT_BIN="$(command -v nft || printf /usr/sbin/nft)"
+            show_generated_config
+            return
             ;;
         --show)
+            need_root
+            NFT_BIN="$(command -v nft || printf /usr/sbin/nft)"
             show_ports
+            return
             ;;
-        --preview)
-            show_generated_config
-            ;;
-        --help|-h)
-            show_cli_usage
-            echo ""
-            show_help
-            ;;
-        *)
-            echo "[ERROR] unknown option: $1"
-            show_cli_usage
-            exit 1
-            ;;
+    esac
+    need_root
+    ensure_nft || return 1
+    ensure_dirs || return 1
+    case "${1:-}" in
+        --init-safe|--initialize|--rescue) initialize_nft_safe ;;
+        --apply) init_files && apply_changes ;;
+        "") init_files && menu ;;
     esac
 }
 

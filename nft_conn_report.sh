@@ -2,7 +2,7 @@
 
 set -e
 
-VERSION="2.1.0"
+VERSION="3.0.0"
 
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 
@@ -33,6 +33,7 @@ pause() {
 }
 
 derive_report_tz_label() {
+    local offset sign hh mm hh_num
     offset="$(TZ="$REPORT_TZ" date '+%z')"
     sign="${offset:0:1}"
     hh="${offset:1:2}"
@@ -100,7 +101,8 @@ need_tools_check() {
         exit 1
     fi
 
-    if ! TZ="$REPORT_TZ" date '+%Y-%m-%d %H:%M:%S %z' >/dev/null 2>&1; then
+    if [[ "$REPORT_TZ" = /* || "$REPORT_TZ" = *..* ]] ||
+        [ ! -f "/usr/share/zoneinfo/$REPORT_TZ" ]; then
         echo "[ERROR] invalid REPORT_TZ: $REPORT_TZ"
         exit 1
     fi
@@ -109,33 +111,39 @@ need_tools_check() {
         derive_report_tz_label
     fi
 
-    if ! printf '%s' "$TOP_N" | grep -Eq '^[0-9]+$' || [ "$TOP_N" -lt 1 ]; then
+    if [[ ! "$TOP_N" =~ ^[0-9]{1,9}$ ]] || [ "$TOP_N" -lt 1 ]; then
         echo "[ERROR] TOP_N must be a positive integer"
         exit 1
     fi
 
-    if ! printf '%s' "$PORT_LIMIT" | grep -Eq '^[0-9]+$'; then
+    if [[ ! "$PORT_LIMIT" =~ ^[0-9]{1,9}$ ]]; then
         echo "[ERROR] PORT_LIMIT must be 0 or a positive integer"
         exit 1
     fi
+    TOP_N="$((10#$TOP_N))"
+    PORT_LIMIT="$((10#$PORT_LIMIT))"
 }
 
 to_epoch() {
+    local local_time
     local_time="$1"
     TZ="$REPORT_TZ" date -d "$local_time" '+%s'
 }
 
 format_epoch() {
+    local epoch
     epoch="$1"
     TZ="$REPORT_TZ" date -d "@$epoch" '+%Y-%m-%dT%H:%M:%S%z'
 }
 
 format_epoch_range() {
+    local epoch
     epoch="$1"
     TZ="$REPORT_TZ" date -d "@$epoch" '+%Y-%m-%d %H:%M:%S %z'
 }
 
 filter_epoch_range() {
+    local start_epoch end_epoch
     start_epoch="$1"
     end_epoch="$2"
 
@@ -149,49 +157,22 @@ filter_epoch_range() {
     }'
 }
 
-journal_query_fast() {
-    start_epoch="$1"
-    end_epoch="$2"
-
-    # Convert epoch to the server local timezone for journalctl arguments.
-    # journalctl parses --since/--until in the server local timezone, so this
-    # avoids passing "+0800" or other offset strings that some systems reject.
-    since_arg="$(date -d "@$start_epoch" '+%Y-%m-%d %H:%M:%S')"
-    until_arg="$(date -d "@$end_epoch" '+%Y-%m-%d %H:%M:%S')"
-
-    journalctl -k -o short-unix --since "$since_arg" --until "$until_arg" --no-pager 2>/dev/null \
-        | grep -F "$LOG_PREFIX" \
-        | filter_epoch_range "$start_epoch" "$end_epoch" || true
-}
-
-journal_query_fallback() {
-    start_epoch="$1"
-    end_epoch="$2"
-
-    # Fallback intentionally does not pass timezone strings to journalctl.
-    # It reads kernel journal lines with epoch timestamps, then filters by epoch itself.
-    journalctl -k -o short-unix --no-pager 2>/dev/null \
-        | grep -F "$LOG_PREFIX" \
-        | filter_epoch_range "$start_epoch" "$end_epoch" || true
-}
-
-get_journal_logs() {
-    start_epoch="$1"
-    end_epoch="$2"
-    out_file="$3"
-
-    tmp_fast="$(mktemp)"
-    journal_query_fast "$start_epoch" "$end_epoch" > "$tmp_fast"
-
-    if [ -s "$tmp_fast" ]; then
-        cat "$tmp_fast" > "$out_file"
-        rm -f "$tmp_fast"
-        return
+get_journal_logs() (
+    local start_epoch="$1" end_epoch="$2" out_file="$3" raw
+    raw="$(mktemp)" || return 1
+    trap 'rm -f -- "$raw"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    # Epoch arguments avoid timezone/DST ambiguity. Include the entire last
+    # second, then remove the next second with the precise epoch filter.
+    if ! journalctl -k -o short-unix --since "@$start_epoch" --until "@$((end_epoch + 1))" --no-pager > "$raw"; then
+        echo "[ERROR] Cannot read kernel journal; report aborted." >&2
+        return 1
     fi
-
-    rm -f "$tmp_fast"
-    journal_query_fallback "$start_epoch" "$end_epoch" > "$out_file"
-}
+    awk -v prefix="$LOG_PREFIX" 'index($0, prefix)' "$raw" \
+        | filter_epoch_range "$start_epoch" "$end_epoch" > "$out_file"
+)
 
 extract_logs_csv() {
     awk '
@@ -233,11 +214,9 @@ extract_logs_csv() {
             }
         }
 
-        if (epoch ~ /^[0-9]+$/ && src != "" && dpt != "") {
-            if (proto == "") {
-                proto="unknown"
-            }
-
+        if (epoch ~ /^[0-9]+$/ && src ~ /^[0-9a-fA-F:.]+$/ &&
+            dpt ~ /^[0-9]+$/ && dpt+0 >= 1 && dpt+0 <= 65535 &&
+            (proto == "tcp" || proto == "udp")) {
             print epoch "," proto "," src "," dpt "," pkt_len
         }
     }
@@ -245,6 +224,7 @@ extract_logs_csv() {
 }
 
 filter_csv_excluded_ports() {
+    local csv_file exclude_ports
     csv_file="$1"
     exclude_ports="$2"
 
@@ -270,6 +250,7 @@ filter_csv_excluded_ports() {
 }
 
 show_port_filter_menu() {
+    local pf
     while true; do
         echo ""
         echo "Select port filter:"
@@ -279,7 +260,7 @@ show_port_filter_menu() {
         echo "4) Exclude 443, 22, 80 TOP${TOP_N}"
         echo "5) Exclude 443, 22, 80, 81 TOP${TOP_N}"
         echo "================================================"
-        read -r -p "Select: " pf
+        read -r -p "Select: " pf || return 1
 
         case "$pf" in
             1)
@@ -311,6 +292,7 @@ show_port_filter_menu() {
 
 
 json_get_string() {
+    local json_text key_name
     json_text="$1"
     key_name="$2"
 
@@ -320,6 +302,7 @@ json_get_string() {
 }
 
 lookup_ip_geo() {
+    local ip api_url api_resp status country region city district isp org geo_text net_text part
     ip="$1"
 
     if [ "${IP_API_GEO:-1}" = "0" ]; then
@@ -332,7 +315,7 @@ lookup_ip_geo() {
     fi
 
     api_url="http://ip-api.com/json/${ip}?lang=zh-CN&fields=status,message,country,regionName,city,district,isp,org,as,query"
-    api_resp="$(curl -fsS --connect-timeout "$IP_API_CONNECT_TIMEOUT" --max-time "$IP_API_MAX_TIME" "$api_url" 2>/dev/null || true)"
+    api_resp="$(curl -g -fsS --connect-timeout "$IP_API_CONNECT_TIMEOUT" --max-time "$IP_API_MAX_TIME" "$api_url" 2>/dev/null || true)"
 
     if [ -z "$api_resp" ]; then
         echo "Geo: unknown"
@@ -400,6 +383,7 @@ human_bytes() {
 }
 
 emit_port_rows() {
+    local csv_file ip len_seen tmp_ports repeated_total single_stats single_ports single_hits single_bytes
     csv_file="$1"
     ip="$2"
     len_seen="$3"
@@ -515,6 +499,7 @@ emit_port_rows() {
 }
 
 report_top_ip_details() {
+    local csv_file start_epoch end_epoch row_count len_rows len_seen total_bytes missing_len_rows top_ips ip hits first_epoch last_epoch ip_bytes ip_len_rows ip_missing_len_rows
     csv_file="$1"
     start_epoch="$2"
     end_epoch="$3"
@@ -591,6 +576,7 @@ report_top_ip_details() {
 }
 
 show_no_data_help() {
+    local title start_epoch end_epoch
     title="$1"
     start_epoch="$2"
     end_epoch="$3"
@@ -616,58 +602,58 @@ show_no_data_help() {
     echo "  REPORT_TZ=Asia/Shanghai bash \"$SCRIPT_PATH\" status"
 }
 
-run_report() {
-    title="$1"
-    start_local="$2"
-    end_local="$3"
-
-    start_epoch="$(to_epoch "$start_local")"
-    end_epoch="$(to_epoch "$end_local")"
-
+run_report() (
+    local title="$1" start_local="$2" end_local="$3" start_epoch end_epoch dir
+    start_epoch="$(to_epoch "$start_local")" || return 1
+    end_epoch="$(to_epoch "$end_local")" || return 1
+    if [ "$start_epoch" -gt "$end_epoch" ]; then
+        echo "[ERROR] start date must be before or equal to end date" >&2
+        return 1
+    fi
     if [ -t 1 ]; then
         clear || true
     fi
-
-    tmp_raw="$(mktemp)"
-    tmp_csv_all="$(mktemp)"
-    tmp_csv="$(mktemp)"
-
-    get_journal_logs "$start_epoch" "$end_epoch" "$tmp_raw"
-    extract_logs_csv < "$tmp_raw" > "$tmp_csv_all"
-    filter_csv_excluded_ports "$tmp_csv_all" "$PORT_EXCLUDE_LIST" > "$tmp_csv"
-
-    if [ ! -s "$tmp_csv" ]; then
+    dir="$(mktemp -d)" || return 1
+    trap 'rm -rf -- "$dir"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    get_journal_logs "$start_epoch" "$end_epoch" "$dir/raw" || return 1
+    extract_logs_csv < "$dir/raw" > "$dir/all.csv" || return 1
+    filter_csv_excluded_ports "$dir/all.csv" "$PORT_EXCLUDE_LIST" > "$dir/report.csv" || return 1
+    if [ ! -s "$dir/report.csv" ]; then
         show_no_data_help "$title" "$start_epoch" "$end_epoch"
-        rm -f "$tmp_raw" "$tmp_csv_all" "$tmp_csv"
-        return
+        return 0
     fi
-
-    report_top_ip_details "$tmp_csv" "$start_epoch" "$end_epoch"
-    rm -f "$tmp_raw" "$tmp_csv_all" "$tmp_csv"
-}
+    report_top_ip_details "$dir/report.csv" "$start_epoch" "$end_epoch"
+)
 
 daily_report() {
+    local start end
     start="$(TZ="$REPORT_TZ" date '+%Y-%m-%d 00:00:00')"
     end="$(TZ="$REPORT_TZ" date '+%Y-%m-%d 23:59:59')"
     run_report "DAILY NFT CONNECTION REPORT" "$start" "$end"
 }
 
 weekly_report() {
+    local start end
     start="$(TZ="$REPORT_TZ" date -d '6 days ago' '+%Y-%m-%d 00:00:00')"
     end="$(TZ="$REPORT_TZ" date '+%Y-%m-%d 23:59:59')"
     run_report "WEEKLY NFT CONNECTION REPORT" "$start" "$end"
 }
 
 custom_report() {
+    local s e start end start_epoch end_epoch
     echo "Input start date in ${REPORT_TZ_LABEL}, example: 2026-06-22"
-    read -r -p "Start date: " s
+    read -r -p "Start date: " s || return 1
 
     echo "Input end date in ${REPORT_TZ_LABEL}, example: 2026-06-22"
-    read -r -p "End date: " e
+    read -r -p "End date: " e || return 1
 
-    if ! TZ="$REPORT_TZ" date -d "$s" >/dev/null 2>&1 || ! TZ="$REPORT_TZ" date -d "$e" >/dev/null 2>&1; then
-        echo "[ERROR] invalid date"
-        return
+    if [[ ! "$s" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ || ! "$e" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] ||
+        ! TZ="$REPORT_TZ" date -d "$s" >/dev/null 2>&1 || ! TZ="$REPORT_TZ" date -d "$e" >/dev/null 2>&1; then
+        echo "[ERROR] invalid date (use YYYY-MM-DD)" >&2
+        return 1
     fi
 
     start="$s 00:00:00"
@@ -676,37 +662,47 @@ custom_report() {
     start_epoch="$(to_epoch "$start")"
     end_epoch="$(to_epoch "$end")"
     if [ "$start_epoch" -gt "$end_epoch" ]; then
-        echo "[ERROR] start date must be before or equal to end date"
-        return
+        echo "[ERROR] start date must be before or equal to end date" >&2
+        return 1
     fi
 
     run_report "CUSTOM NFT CONNECTION REPORT" "$start" "$end"
 }
 
-print_recent_logs_localized() {
-    journalctl -k -o short-unix --no-pager 2>/dev/null \
-        | grep -F "$LOG_PREFIX" \
+print_recent_logs_localized() (
+    local raw log_line epoch_part rest_part epoch_sec
+    raw="$(mktemp)" || return 1
+    trap 'rm -f -- "$raw"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if ! journalctl -k -o short-unix --no-pager > "$raw"; then
+        echo "[ERROR] Cannot read kernel journal." >&2
+        return 1
+    fi
+    awk -v prefix="$LOG_PREFIX" 'index($0, prefix)' "$raw" \
         | tail -n 10 \
         | while IFS= read -r log_line; do
             epoch_part="${log_line%% *}"
             rest_part="${log_line#* }"
             epoch_sec="${epoch_part%%.*}"
-            if printf "%s" "$epoch_sec" | grep -Eq '^[0-9]+$'; then
+            if [[ "$epoch_sec" =~ ^[0-9]+$ ]]; then
                 printf "%s %s %s\n" "$(format_epoch "$epoch_sec")" "$REPORT_TZ_LABEL" "$rest_part"
             else
                 printf "%s\n" "$log_line"
             fi
         done
-}
+)
 
 raw_logs_tail() {
     line
     echo "RAW NFT LOGS TAIL, CONVERTED TO ${REPORT_TZ_LABEL}"
     line
-    print_recent_logs_localized || true
+    print_recent_logs_localized
 }
 
 check_status() {
+    local now_epoch
     line
     echo "STATUS CHECK"
     line
@@ -728,10 +724,11 @@ check_status() {
 
     echo ""
     echo "[recent logs converted to ${REPORT_TZ_LABEL}]"
-    print_recent_logs_localized || true
+    print_recent_logs_localized
 }
 
 menu() {
+    local c
     while true; do
         echo ""
         echo "===== NFT CONNECTION REPORT TOP${TOP_N} ${REPORT_TZ_LABEL} v$VERSION ====="
@@ -743,7 +740,7 @@ menu() {
         echo "6) Help"
         echo "7) Exit"
         echo "================================================"
-        read -r -p "Select: " c
+        read -r -p "Select: " c || return 0
 
         case "$c" in
             1)
@@ -783,37 +780,28 @@ menu() {
     done
 }
 
-if [ "${1:-}" = "--version" ]; then
-    echo "$(basename "$SCRIPT_PATH") v$VERSION"
-    exit 0
+main() {
+    if [ "$#" -gt 1 ]; then
+        usage
+        return 1
+    fi
+    case "${1:-}" in
+        --version) echo "${SCRIPT_PATH##*/} v$VERSION"; return 0 ;;
+        help|-h|--help) usage; return 0 ;;
+        daily|weekly|custom|raw|status|"") ;;
+        *) usage; return 1 ;;
+    esac
+    need_tools_check || return 1
+    case "${1:-}" in
+        daily) daily_report ;;
+        weekly) weekly_report ;;
+        custom) custom_report ;;
+        raw) raw_logs_tail ;;
+        status) check_status ;;
+        "") menu ;;
+    esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
 fi
-
-need_tools_check
-
-case "${1:-}" in
-    daily)
-        daily_report
-        ;;
-    weekly)
-        weekly_report
-        ;;
-    custom)
-        custom_report
-        ;;
-    raw)
-        raw_logs_tail
-        ;;
-    status)
-        check_status
-        ;;
-    help|-h|--help)
-        usage
-        ;;
-    "")
-        menu
-        ;;
-    *)
-        usage
-        exit 1
-        ;;
-esac
