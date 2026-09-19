@@ -17,7 +17,7 @@
 
 set -e
 
-VERSION="3.1.0"
+VERSION="3.1hotfix"
 
 SCRIPT_PATH="${0:-firewall_nft_manager.sh}"
 SCRIPT_NAME="${SCRIPT_PATH##*/}"
@@ -1699,12 +1699,17 @@ import_active_accept_ports() (
 )
 
 show_port_input_help() {
-    local label="$1" file="$2" current
+    local label="$1" file="$2" action="${3:-}" current
     current="$(csv_from_file "$file")" || return 1
     echo "Examples:"
     echo "  53"
-    echo "  3666-3669"
-    echo "  53,3666-3669"
+    if [ "$label" = "UDP" ] && [ "$action" = "add" ]; then
+        echo "  15000-18369"
+        echo "  53,3667,15000-18369"
+    else
+        echo "  3666-3669"
+        echo "  53,3666-3669"
+    fi
     printf 'Current saved %s ports: %s\n' "$label" "${current:-none}"
 }
 
@@ -1727,7 +1732,7 @@ add_ports() {
             ;;
     esac
 
-    show_port_input_help "$label" "$file" || return 1
+    show_port_input_help "$label" "$file" add || return 1
     read -r -p "port(s): " input
 
     add_csv="$(csv_from_text "$input")" || return 1

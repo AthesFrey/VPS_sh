@@ -2,7 +2,7 @@
 
 set -e
 
-VERSION="3.1.0"
+VERSION="3.1hotfix"
 
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 
