@@ -203,7 +203,6 @@ services:
       WEB_TERMINAL: "0"
       WEB_FILE_MANAGER: "0"
       WEB_NOTIFICATION: "0"
-      WEB_HOST_CLIPBOARD_SYNC: "0"
       ENABLE_CJK_FONT: "1"
     volumes:
       - ./firefox-config:/config

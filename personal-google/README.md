@@ -9,10 +9,10 @@
 首次安装会交互询问 Firefox 登录用户名和密码。用户名留空时使用 `google`；密码需要至少 8 位并输入两次。提示是隐藏密码的。脚本通过 `/dev/tty` 读取输入，因此可以直接使用管道安装：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/AthesFrey/VPS_sh/refs/heads/main/personal-google/install_google_search.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/AthesFrey/Paseo-Codex-AI/main/personal-google-browser/install_google_search.sh | sudo bash
 ```
 
-普通重跑会复用原凭据和 Firefox 配置，拉取脚本指定的 Firefox 镜像并更新或启动服务。安装文件保存在 `/opt/personal-google-browser`；凭据写入权限为 `600` 的 `.env`，Firefox 配置和 Google 登录状态保存在 `firefox-config/`。修改脚本中的容器设置后再次运行会应用新设置，可能重建 Firefox 容器，但会保留 `.env` 和 `firefox-config/`。
+普通重跑会复用原凭据和 Firefox 配置，拉取脚本指定的 Firefox 镜像并更新或启动服务。安装文件保存在 `/opt/personal-google-browser`；凭据写入权限为 `600` 的 `.env`，Firefox 配置和 Google 登录状态保存在 `firefox-config/`。
 
 如果忘记网页登录凭据，可在 VPS 上运行 `sudo cat /opt/personal-google-browser/.env` 查看。不要分享这个文件或 `firefox-config/`。
 
@@ -21,7 +21,7 @@ curl -fsSL https://raw.githubusercontent.com/AthesFrey/VPS_sh/refs/heads/main/pe
 `--force` 会要求输入 `RESET`，然后重新设置用户名和密码，并删除本工具管理的 Firefox 容器、Firefox 配置和旧凭据。它会保留 NPM 容器、NPM 页面配置和 Docker 网络。这个操作会清除 Google 登录状态及浏览器内的数据：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/AthesFrey/VPS_sh/refs/heads/main/personal-google/install_google_search.sh | sudo bash -s -- --force
+curl -fsSL https://raw.githubusercontent.com/AthesFrey/Paseo-Codex-AI/main/personal-google-browser/install_google_search.sh | sudo bash -s -- --force
 ```
 
 ## NPM 页面设置
@@ -39,16 +39,6 @@ curl -fsSL https://raw.githubusercontent.com/AthesFrey/VPS_sh/refs/heads/main/pe
 在 SSL 页面申请 Let's Encrypt 证书，签发成功后启用 **Force SSL**。确认 HTTPS 可用后，可按需将 Cloudflare 改为 Proxied（橙云），并将 SSL/TLS 模式设为 **Full (strict)**。
 
 之后访问你的域名，先使用脚本设置的 Firefox 网页用户名和密码登录，再在远程 Firefox 中登录 Google。Google AI Mode 是否可用仍取决于 Google 账号资格、地区和 VPS 出口位置。
-
-## 输入中文
-
-脚本已开启中日韩字体，并关闭主机剪贴板自动同步，使网页控制栏里的剪贴板输入框保持可用。无需在 Firefox 容器里另外安装中文输入法：
-
-1. 在远程 Firefox 画面左侧点开三点控制栏，展开 **Clipboard** 区域。
-2. 点控制栏里的多行输入框，使用手机或电脑自己的中文输入法输入中文。输入后点到框外，让文字同步到远程 Firefox 的剪贴板。
-3. 回到 Google 搜索框并执行粘贴（电脑可按 `Ctrl+V`；手机可在搜索框长按并选择“粘贴”）。
-
-`ENABLE_CJK_FONT=1` 负责显示中文字符；中文拼音转换由访问网页的设备输入法完成。若手机页面空间较窄，控制栏可能默认折叠，先点左侧三点标签打开它。
 
 ## 数据和维护
 
