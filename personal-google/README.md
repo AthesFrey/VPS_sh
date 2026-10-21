@@ -9,7 +9,7 @@
 首次安装会交互询问 Firefox 登录用户名和密码。用户名留空时使用 `google`；密码需要至少 8 位并输入两次。提示是隐藏密码的。脚本通过 `/dev/tty` 读取输入，因此可以直接使用管道安装：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/AthesFrey/Paseo-Codex-AI/main/personal-google-browser/install_google_search.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/AthesFrey/VPS_sh/refs/heads/main/personal-google/install_google_search.sh | sudo bash
 ```
 
 普通重跑会复用原凭据和 Firefox 配置，拉取脚本指定的 Firefox 镜像并更新或启动服务。安装文件保存在 `/opt/personal-google-browser`；凭据写入权限为 `600` 的 `.env`，Firefox 配置和 Google 登录状态保存在 `firefox-config/`。
@@ -21,7 +21,7 @@ curl -fsSL https://raw.githubusercontent.com/AthesFrey/Paseo-Codex-AI/main/perso
 `--force` 会要求输入 `RESET`，然后重新设置用户名和密码，并删除本工具管理的 Firefox 容器、Firefox 配置和旧凭据。它会保留 NPM 容器、NPM 页面配置和 Docker 网络。这个操作会清除 Google 登录状态及浏览器内的数据：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/AthesFrey/Paseo-Codex-AI/main/personal-google-browser/install_google_search.sh | sudo bash -s -- --force
+curl -fsSL https://raw.githubusercontent.com/AthesFrey/VPS_sh/refs/heads/main/personal-google/install_google_search.sh | sudo bash -s -- --force
 ```
 
 ## NPM 页面设置
