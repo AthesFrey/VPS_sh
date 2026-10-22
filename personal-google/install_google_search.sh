@@ -6,7 +6,7 @@ readonly PROJECT_NAME="personal-google-browser"
 readonly CONTAINER_NAME="google-browser"
 readonly NETWORK_NAME="personal-google-browser-proxy"
 readonly NPM_CONTAINER="npm"
-readonly IMAGE="jlesage/firefox:v26.09.1"
+readonly IMAGE="jlesage/firefox:latest"
 
 ENV_FILE="$INSTALL_DIR/.env"
 COMPOSE_FILE="$INSTALL_DIR/compose.yaml"
@@ -203,6 +203,7 @@ services:
       WEB_TERMINAL: "0"
       WEB_FILE_MANAGER: "0"
       WEB_NOTIFICATION: "0"
+      WEB_HOST_CLIPBOARD_SYNC: "1"
       ENABLE_CJK_FONT: "1"
     volumes:
       - ./firefox-config:/config
